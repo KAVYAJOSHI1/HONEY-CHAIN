@@ -46,5 +46,22 @@ class Telemetry(Base):
     humidity = Column(Float)
     weight = Column(Float)
     timestamp = Column(DateTime, default=datetime.utcnow)
-    
     hive = relationship("Hive", back_populates="telemetry")
+
+class Batch(Base):
+    __tablename__ = "batches"
+
+    id = Column(Integer, primary_key=True, index=True)
+    batch_id = Column(String, unique=True, index=True)
+    hive_id = Column(Integer, ForeignKey("hives.id"))
+    token_id = Column(String)
+    ipfs_cid = Column(String)
+    tx_hash = Column(String)
+    health_score = Column(Float)
+    is_revoked = Column(Boolean, default=False)
+    revocation_reason = Column(String, nullable=True)
+    blockchain_mode = Column(String, default="demo")
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    hive = relationship("Hive")

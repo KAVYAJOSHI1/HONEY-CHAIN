@@ -11,9 +11,10 @@ def upload_to_ipfs_mock(batch_data: dict) -> str:
     We'll return a deterministic mock CID based on the data.
     """
     data_str = json.dumps(batch_data, sort_keys=True)
-    hash_obj = hashlib.sha256(data_str.encode('utf-8')).hexdigest()
+    hash_obj = hashlib.sha256(data_str.encode('utf-8')).digest()
     # Create a mock IPFS CID starting with 'Qm'
-    mock_cid = "Qm" + base64.b58encode(bytes.fromhex(hash_obj)).decode('utf-8')[:44]
+    b64_str = base64.b64encode(hash_obj).decode('utf-8').replace('+', 'X').replace('/', 'Y').replace('=', '')
+    mock_cid = "Qm" + b64_str[:44]
     return f"ipfs://{mock_cid}"
 
 def generate_qr_code(batch_id: str, base_url: str = "https://honeychain.app/consumer/") -> str:

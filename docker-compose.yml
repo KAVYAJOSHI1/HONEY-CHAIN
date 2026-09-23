@@ -8,8 +8,6 @@ services:
       POSTGRES_USER: honeyuser
       POSTGRES_PASSWORD: honeypassword
       POSTGRES_DB: honeydb
-    ports:
-      - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
@@ -19,14 +17,13 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     ports:
-      - "8000:8000"
+      - "8005:8000"
     environment:
       - DATABASE_URL=postgresql://honeyuser:honeypassword@postgres:5432/honeydb
     depends_on:
       - postgres
     volumes:
       - ./backend/app:/app/app
-      - ./backend/ai:/app/ai
 
   # Next.js Frontend Service
   frontend:
@@ -34,9 +31,9 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
     ports:
-      - "3000:3000"
+      - "3005:3000"
     environment:
-      - NEXT_PUBLIC_API_URL=http://localhost:8000
+      - NEXT_PUBLIC_API_URL=http://localhost:8005
     depends_on:
       - backend
 
