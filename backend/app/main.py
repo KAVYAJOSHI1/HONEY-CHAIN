@@ -6,6 +6,7 @@ from typing import List
 
 from . import models, database
 from .ai.vision_model import vision_model
+from . import utils
 
 # Initialize DB tables
 models.Base.metadata.create_all(bind=database.engine)
@@ -32,6 +33,12 @@ class HiveCreate(BaseModel):
     cluster_id: int
     gps_lat: float
     gps_long: float
+
+class BatchCreate(BaseModel):
+    hive_id: int
+    floral_source: str
+    weight: float
+    health_score: float
 
 # --- Routes ---
 @app.get("/")
@@ -87,6 +94,40 @@ async def analyze_hive_frame(file: UploadFile = File(...)):
     return {
         "filename": file.filename,
         "results": results
+    }
+
+@app.post("/mint-batch/")
+def mint_batch(batch: BatchCreate):
+    """
+    Phase 4: End-to-End Minting Flow
+    Accepts extraction details, uploads metadata to IPFS, and triggers
+    the Sepolia NFT mint. (Smart contract interaction mocked for API).
+    """
+    # 1. Prepare Metadata
+    metadata = {
+        "hive_id": batch.hive_id,
+        "floral_source": batch.floral_source,
+        "weight_kg": batch.weight,
+        "ai_health_score": batch.health_score,
+        "timestamp": "2026-03-15T12:00:00Z"
+    }
+    
+    # 2. Upload to IPFS
+    ipfs_uri = utils.upload_to_ipfs_mock(metadata)
+    
+    # 3. Simulate Smart Contract Mint on Sepolia (would use web3.py here)
+    mock_tx_hash = "0x8f2d5A...3c9E41"
+    mock_token_id = "104"
+    
+    # 4. Generate Consumer QR Code
+    qr_base64 = utils.generate_qr_code(batch_id=mock_token_id)
+    
+    return {
+        "status": "success",
+        "token_id": mock_token_id,
+        "ipfs_uri": ipfs_uri,
+        "sepolia_tx": mock_tx_hash,
+        "qr_code_image": qr_base64
     }
 
 @app.get("/telemetry/{hive_id}")
