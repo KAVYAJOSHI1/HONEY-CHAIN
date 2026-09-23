@@ -1,0 +1,54 @@
+version: '3.8'
+
+services:
+  # Database Service
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: honeyuser
+      POSTGRES_PASSWORD: honeypassword
+      POSTGRES_DB: honeydb
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  # FastAPI Backend Service
+  backend:
+    build: 
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://honeyuser:honeypassword@postgres:5432/honeydb
+    depends_on:
+      - postgres
+    volumes:
+      - ./backend/app:/app/app
+      - ./backend/ai:/app/ai
+
+  # Next.js Frontend Service
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+    depends_on:
+      - backend
+
+  # IoT Simulator
+  iot-simulator:
+    image: python:3.12-slim
+    working_dir: /app
+    volumes:
+      - ./iot/simulator:/app
+    command: python simulator.py
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:
