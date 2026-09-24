@@ -3,6 +3,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from tests.conftest import beekeeper_headers, kvic_headers, seed_test_users
 
 os.environ["DATABASE_URL"] = "sqlite:///./test_honeychain.db"
 os.environ["BLOCKCHAIN_MODE"] = "demo"
@@ -36,6 +37,7 @@ def setup_v2_database():
     for t_step in range(5):
         db.add(Telemetry(hive_id=1, temperature=34.5, humidity=50.0, weight=25.0 + t_step))
     db.commit()
+    seed_test_users(db)
     yield
     Base.metadata.drop_all(bind=engine)
 
@@ -103,14 +105,14 @@ def test_audit_logs_and_security():
     assert res_audit.status_code == 200
     assert isinstance(res_audit.json(), list)
 
-    res_sec = client.get("/admin/security")
+    res_sec = client.get("/admin/security", headers=kvic_headers())
     assert res_sec.status_code == 200
     data_sec = res_sec.json()
     assert "security_status" in data_sec
     assert "events" in data_sec
 
 def test_analytics_dashboard():
-    res = client.get("/admin/analytics")
+    res = client.get("/admin/analytics", headers=kvic_headers())
     assert res.status_code == 200
     data = res.json()
     assert "production" in data

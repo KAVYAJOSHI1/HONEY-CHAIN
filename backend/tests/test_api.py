@@ -3,6 +3,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from tests.conftest import beekeeper_headers, kvic_headers, seed_test_users
 
 # Setup test DB
 os.environ["DATABASE_URL"] = "sqlite:///./test_honeychain.db"
@@ -33,6 +34,7 @@ def setup_database():
     hive = Hive(id=1, owner_id=1, cluster_id=1, gps_lat=40.0, gps_long=-75.0)
     db.add(hive)
     db.commit()
+    seed_test_users(db)
     yield
     Base.metadata.drop_all(bind=engine)
 
@@ -74,7 +76,7 @@ def test_analyze_frame_invalid_mime():
 
 def test_mint_batch_and_retrieve():
     # Create batch
-    mint_res = client.post("/mint-batch/", json={
+    mint_res = client.post("/mint-batch/", headers=beekeeper_headers(), json={
         "hive_id": 1,
         "floral_source": "Test Honey",
         "weight": 32.0,
@@ -103,7 +105,7 @@ def test_retrieve_missing_batch():
     assert res.status_code == 404
 
 def test_revoke_batch():
-    mint_res = client.post("/mint-batch/", json={
+    mint_res = client.post("/mint-batch/", headers=beekeeper_headers(), json={
         "hive_id": 1,
         "floral_source": "Test Honey 2",
         "weight": 31.0,
@@ -111,7 +113,7 @@ def test_revoke_batch():
     })
     batch_id = mint_res.json()["batch_id"]
 
-    revoke_res = client.post(f"/batches/{batch_id}/revoke", json={"reason": "Test revocation"})
+    revoke_res = client.post(f"/batches/{batch_id}/revoke", headers=kvic_headers(), json={"reason": "Test revocation"})
     assert revoke_res.status_code == 200
     
     get_res = client.get(f"/batches/{batch_id}")
@@ -119,11 +121,11 @@ def test_revoke_batch():
     assert get_res.json()["revocation_reason"] == "Test revocation"
 
 def test_revoke_missing_batch():
-    revoke_res = client.post("/batches/invalid-id/revoke", json={"reason": "test"})
+    revoke_res = client.post("/batches/invalid-id/revoke", headers=kvic_headers(), json={"reason": "test"})
     assert revoke_res.status_code == 404
 
 def test_qr_code_integrity():
-    mint_res = client.post("/mint-batch/", json={
+    mint_res = client.post("/mint-batch/", headers=beekeeper_headers(), json={
         "hive_id": 1,
         "floral_source": "Test QR",
         "weight": 25.0,
@@ -136,7 +138,7 @@ def test_qr_code_integrity():
     assert "data:image/png;base64," in qr_code
     
 def test_verify_integrity_valid():
-    mint_res = client.post("/mint-batch/", json={
+    mint_res = client.post("/mint-batch/", headers=beekeeper_headers(), json={
         "hive_id": 1,
         "floral_source": "Wildflower",
         "weight": 32.5,
@@ -152,7 +154,7 @@ def test_verify_integrity_valid():
     assert data["current_hash"] == data["anchored_hash"]
 
 def test_verify_integrity_tampered():
-    mint_res = client.post("/mint-batch/", json={
+    mint_res = client.post("/mint-batch/", headers=beekeeper_headers(), json={
         "hive_id": 1,
         "floral_source": "Wildflower",
         "weight": 32.5,
@@ -219,7 +221,7 @@ def test_simulate_scenario():
     assert res.json()["telemetry"]["hive_id"] == 1
 
 def test_tamper_and_restore_batch():
-    mint_res = client.post("/mint-batch/", json={
+    mint_res = client.post("/mint-batch/", headers=beekeeper_headers(), json={
         "hive_id": 1,
         "floral_source": "Wildflower",
         "weight": 32.5,

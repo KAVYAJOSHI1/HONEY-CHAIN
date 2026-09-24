@@ -19,6 +19,7 @@ from sqlalchemy import func, or_, text
 from sqlalchemy.orm import Session
 
 from . import database, models, utils
+from .auth import create_access_token, get_current_user, get_current_user_optional, require_role, LoginRequest
 from .ai.anomaly_detector import HiveAnomalyDetector
 from .ai.vision_model import InvalidImageError, vision_model
 from .intelligence import (
@@ -34,12 +35,11 @@ MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
 anomaly_detector = HiveAnomalyDetector()
 anomaly_detector.train_on_baseline()
 
-database.migrate()
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.loop = asyncio.get_running_loop()
+    database.migrate()
     if os.getenv("AUTO_SEED", "true").lower() == "true":
         from .seed import seed_if_empty
         if seed_if_empty():
@@ -291,6 +291,38 @@ class HoneyBotRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=500)
 
 
+# --- Authentication ----------------------------------------------------------
+@app.post('/auth/login', tags=['Authentication'])
+def login(req: LoginRequest, db: Session = Depends(database.get_db)):
+    user = db.query(models.User).filter(models.User.wallet_address == req.wallet_address).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    token = create_access_token(data={"sub": str(user.id), "role": user.role, "name": user.name})
+    return {
+        "token": token,
+        "user": {
+            "id": user.id,
+            "name": user.name,
+            "role": user.role,
+            "wallet_address": user.wallet_address
+        }
+    }
+
+@app.get('/auth/me', tags=['Authentication'])
+def get_me(user: models.User = Depends(get_current_user)):
+    return {
+        "id": user.id,
+        "name": user.name,
+        "role": user.role,
+        "wallet_address": user.wallet_address
+    }
+
+@app.get('/auth/users', tags=['Authentication'])
+def list_users(db: Session = Depends(database.get_db)):
+    users = db.query(models.User).all()
+    return [{"id": u.id, "name": u.name, "role": u.role, "wallet_address": u.wallet_address} for u in users]
+
+
 # --- System ------------------------------------------------------------------
 @app.get("/", tags=["System"])
 def read_root():
@@ -369,7 +401,7 @@ def search(q: str, db: Session = Depends(database.get_db)):
 
 
 @app.post("/system/reset-demo", tags=["System"])
-def reset_demo_system():
+def reset_demo_system(_user=Depends(require_role("KVIC_ADMIN", "ADMIN", "KVIC"))):
     from .seed import reset_db, seed_data
     try:
         database.engine.dispose()
@@ -744,7 +776,7 @@ async def analyze_hive_frame(
 
 # --- Batches & blockchain ------------------------------------------------------
 @app.post("/mint-batch/", tags=["Blockchain & Traceability"])
-def mint_batch(batch: BatchCreate, db: Session = Depends(database.get_db)):
+def mint_batch(batch: BatchCreate, db: Session = Depends(database.get_db), _user=Depends(require_role("BEEKEEPER", "KVIC_ADMIN", "ADMIN"))):
     get_hive_or_404(db, batch.hive_id)
     floral = batch.floral_source.strip()
     now = datetime.utcnow()
@@ -799,40 +831,8 @@ def get_batch_qr(batch_id: str, db: Session = Depends(database.get_db)):
     return {"batch_id": b.batch_id, "verification_url": utils.verification_url(b.batch_id), "qr_code": utils.generate_qr_code(b.batch_id)}
 
 
-@app.get("/batches/{batch_id}/timeline", tags=["Blockchain & Traceability"])
-def get_batch_timeline(batch_id: str, db: Session = Depends(database.get_db)):
-    """Provenance events for the consumer passport, built from real records."""
-    b = get_batch_or_404(db, batch_id)
-    hive = db.query(models.Hive).filter(models.Hive.id == b.hive_id).first()
-    events = []
-    if hive:
-        events.append({"key": "registered", "title": "Hive registered", "timestamp": iso(hive.installed_at),
-                       "detail": f"Hive #{hive.id} registered{' at ' + hive.cluster.name if hive.cluster else ''} with GPS-tagged IoT sensors."})
-    tel_count = db.query(models.Telemetry).filter(models.Telemetry.hive_id == b.hive_id, models.Telemetry.timestamp <= b.created_at).count()
-    first_tel = db.query(models.Telemetry).filter(models.Telemetry.hive_id == b.hive_id).order_by(models.Telemetry.timestamp.asc()).first()
-    if tel_count:
-        events.append({"key": "monitoring", "title": "Continuous IoT monitoring", "timestamp": iso(first_tel.timestamp) if first_tel else None,
-                       "detail": f"{tel_count} temperature, humidity and weight readings recorded before harvest."})
-    inspection = (
-        db.query(models.AIAnalysis)
-        .filter(models.AIAnalysis.hive_id == b.hive_id, models.AIAnalysis.timestamp <= b.created_at + timedelta(days=1))
-        .order_by(models.AIAnalysis.timestamp.desc())
-        .first()
-    )
-    if inspection:
-        events.append({"key": "inspection", "title": "AI frame inspection", "timestamp": iso(inspection.timestamp),
-                       "detail": f"{inspection.varroa_count} Varroa mites detected; frame health {inspection.health_score}/100."})
-    events.append({"key": "harvest", "title": "Harvest & batch creation", "timestamp": iso(b.created_at),
-                   "detail": f"{b.weight_kg} kg of {b.floral_source} extracted. Colony health score {b.health_score}/100."})
-    events.append({"key": "anchored", "title": "Provenance anchored" + (" on Sepolia" if b.blockchain_mode == "sepolia" else " (demo ledger)"),
-                   "timestamp": iso(b.created_at), "detail": f"Token #{b.token_id} minted; metadata pinned at {b.ipfs_cid}."})
-    if b.is_revoked:
-        events.append({"key": "revoked", "title": "Revoked by KVIC", "timestamp": iso(b.updated_at), "detail": b.revocation_reason or "Batch revoked."})
-    return events
-
-
 @app.post("/batches/{batch_id}/revoke", tags=["Blockchain & Traceability"])
-def revoke_batch(batch_id: str, req: RevokeRequest, db: Session = Depends(database.get_db)):
+def revoke_batch(batch_id: str, req: RevokeRequest, db: Session = Depends(database.get_db), _user=Depends(require_role("KVIC_ADMIN", "ADMIN", "KVIC"))):
     b = get_batch_or_404(db, batch_id)
     if b.is_revoked:
         raise HTTPException(status_code=409, detail="Batch is already revoked")
@@ -874,6 +874,64 @@ def verify_integrity(batch_id: str, actor: str = "Consumer", db: Session = Depen
     result = integrity_of(get_batch_or_404(db, batch_id))
     actor = actor.strip()[:40] or "Consumer"
     record_audit_log(db, action="Integrity Verified", actor=actor, details=f"Verified batch {batch_id} authenticity: {result['verified']}")
+    return result
+
+
+@app.get('/batches/{batch_id}/verify-onchain', tags=['Blockchain & Traceability'])
+def verify_onchain(batch_id: str, db: Session = Depends(database.get_db)):
+    """Query the smart contract to verify on-chain batch validity."""
+    b = get_batch_or_404(db, batch_id)
+    
+    offchain = integrity_of(b)
+    result = {
+        'batch_id': b.batch_id,
+        'token_id': b.token_id,
+        'blockchain_mode': b.blockchain_mode,
+        'offchain_verification': offchain,
+        'onchain_verification': None,
+        'consensus': None,
+    }
+    
+    if b.blockchain_mode != 'sepolia' or not b.token_id:
+        result['onchain_verification'] = {'status': 'DEMO_MODE', 'detail': 'Batch anchored on demo ledger; no on-chain state to query.'}
+        result['consensus'] = 'DEMO_ONLY'
+        return result
+    
+    try:
+        from web3 import Web3
+        rpc_url = os.getenv('SEPOLIA_RPC_URL') or os.getenv('INFURA_URL')
+        contract_address = os.getenv('CONTRACT_ADDRESS')
+        if not rpc_url or not contract_address:
+            raise RuntimeError('RPC or contract address not configured')
+        
+        w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={'timeout': 15}))
+        # isBatchValid is a public mapping, we need the ABI for it
+        abi = [{'inputs': [{'internalType': 'uint256', 'name': '', 'type': 'uint256'}], 'name': 'isBatchValid', 'outputs': [{'internalType': 'bool', 'name': '', 'type': 'bool'}], 'stateMutability': 'view', 'type': 'function'}]
+        contract = w3.eth.contract(address=Web3.to_checksum_address(contract_address), abi=abi)
+        
+        is_valid = contract.functions.isBatchValid(int(b.token_id)).call()
+        result['onchain_verification'] = {
+            'status': 'VALID' if is_valid else 'REVOKED_ONCHAIN',
+            'token_valid': is_valid,
+            'contract_address': contract_address,
+            'chain_id': 11155111,
+            'explorer_url': f'https://sepolia.etherscan.io/tx/{b.tx_hash}' if b.tx_hash else None,
+        }
+        
+        # Consensus: both off-chain and on-chain agree
+        if offchain['verified'] and is_valid:
+            result['consensus'] = 'FULLY_VERIFIED'
+        elif not offchain['verified'] and not is_valid:
+            result['consensus'] = 'CONSISTENTLY_INVALID'
+        else:
+            result['consensus'] = 'MISMATCH_DETECTED'
+            record_security_event(db, 'ONCHAIN_MISMATCH', 'HIGH', f'Off-chain/on-chain mismatch for batch {batch_id}', 'Verification Engine')
+    except Exception as exc:
+        logger.warning('On-chain verification failed for %s: %s', batch_id, exc)
+        result['onchain_verification'] = {'status': 'UNAVAILABLE', 'detail': str(exc)}
+        result['consensus'] = 'ONCHAIN_UNAVAILABLE'
+    
+    record_audit_log(db, action='On-Chain Verification', actor='Verification Engine', details=f'Verified batch {batch_id}: {result["consensus"]}')
     return result
 
 
@@ -974,7 +1032,7 @@ def list_audit_logs(limit: int = 200, action: Optional[str] = None, db: Session 
 
 
 @app.get("/admin/security", tags=["Audit & Security"])
-def security_dashboard(db: Session = Depends(database.get_db)):
+def security_dashboard(db: Session = Depends(database.get_db), _user=Depends(require_role("KVIC_ADMIN", "ADMIN", "KVIC"))):
     batches = db.query(models.Batch).all()
     integrity = [integrity_of(b) for b in batches]
     mismatched = sum(1 for i in integrity if i["is_tampered"])
@@ -1006,7 +1064,7 @@ def security_dashboard(db: Session = Depends(database.get_db)):
 
 
 @app.get("/admin/analytics", tags=["Admin & Analytics"])
-def analytics_dashboard(db: Session = Depends(database.get_db)):
+def analytics_dashboard(db: Session = Depends(database.get_db), _user=Depends(require_role("KVIC_ADMIN", "ADMIN", "KVIC"))):
     hives = db.query(models.Hive).all()
     total_hives = len(hives)
     batches = db.query(models.Batch).all()

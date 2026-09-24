@@ -3,6 +3,7 @@ import hashlib
 import json
 import logging
 import os
+import urllib.request
 from dataclasses import dataclass
 from typing import Optional
 
@@ -56,14 +57,40 @@ class IPFSService:
     @staticmethod
     def pin_json(data: dict) -> str:
         if IPFS_MODE == "real":
-            # Real implementation using Pinata / Web3.Storage goes here.
-            raise HTTPException(status_code=501, detail="Real IPFS provider not configured")
+            pinata_api_key = os.getenv("PINATA_API_KEY")
+            pinata_secret_key = os.getenv("PINATA_SECRET_KEY")
+            if pinata_api_key and pinata_secret_key:
+                try:
+                    payload = json.dumps({"pinataContent": data}).encode("utf-8")
+                    req = urllib.request.Request(
+                        "https://api.pinata.cloud/pinning/pinJSONToIPFS",
+                        data=payload,
+                        headers={
+                            "Content-Type": "application/json",
+                            "pinata_api_key": pinata_api_key,
+                            "pinata_secret_api_key": pinata_secret_key,
+                        },
+                    )
+                    with urllib.request.urlopen(req) as response:
+                        res_data = json.loads(response.read().decode("utf-8"))
+                        if "IpfsHash" in res_data:
+                            return f"ipfs://{res_data['IpfsHash']}"
+                except Exception as exc:
+                    logger.warning("[PINATA_FALLBACK] Failed to pin to Pinata: %s", exc)
+            else:
+                logger.warning("[PINATA_FALLBACK] Pinata credentials missing")
 
         # Deterministic mock CID derived from the metadata content.
         data_str = json.dumps(data, sort_keys=True)
         digest = hashlib.sha256(data_str.encode("utf-8")).digest()
         b64_str = base64.b64encode(digest).decode("utf-8").replace("+", "X").replace("/", "Y").replace("=", "")
         return f"ipfs://Qm{b64_str[:44]}"
+
+    @staticmethod
+    def get_gateway_url(cid: str) -> str:
+        if cid.startswith("ipfs://"):
+            return cid.replace("ipfs://", "https://gateway.pinata.cloud/ipfs/")
+        return cid
 
 
 @dataclass
@@ -97,9 +124,19 @@ class BlockchainService:
             "chainId": 11155111,  # Sepolia
             "from": account.address,
             "nonce": w3.eth.get_transaction_count(account.address),
-            "maxFeePerGas": w3.to_wei("50", "gwei"),
-            "maxPriorityFeePerGas": w3.to_wei("2", "gwei"),
         })
+        try:
+            latest_block = w3.eth.get_block('latest')
+            base_fee = latest_block.get('baseFeePerGas', w3.to_wei('30', 'gwei'))
+            max_priority = w3.to_wei('2', 'gwei')
+            max_fee = base_fee * 2 + max_priority
+            
+            tx["maxFeePerGas"] = max_fee
+            tx["maxPriorityFeePerGas"] = max_priority
+        except Exception as exc:
+            logger.warning("Dynamic gas estimation failed, using hardcoded fallback: %s", exc)
+            tx["maxFeePerGas"] = w3.to_wei("50", "gwei")
+            tx["maxPriorityFeePerGas"] = w3.to_wei("2", "gwei")
         tx["gas"] = int(w3.eth.estimate_gas(tx) * 1.2)
         signed = w3.eth.account.sign_transaction(tx, private_key)
         raw = getattr(signed, "raw_transaction", None) or signed.rawTransaction  # web3 v7 / v6
