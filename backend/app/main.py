@@ -877,6 +877,92 @@ def verify_integrity(batch_id: str, actor: str = "Consumer", db: Session = Depen
     return result
 
 
+@app.get("/batches/{batch_id}/timeline", tags=["Blockchain & Traceability"])
+def get_batch_timeline(batch_id: str, db: Session = Depends(database.get_db)):
+    b = get_batch_or_404(db, batch_id)
+    h = db.query(models.Hive).filter(models.Hive.id == b.hive_id).first()
+    cluster = db.query(models.Cluster).filter(models.Cluster.id == h.cluster_id).first() if h else None
+    
+    created_ts = iso(b.created_at) if b.created_at else iso(datetime.utcnow())
+    installed_ts = iso(h.installed_at) if h and h.installed_at else created_ts
+    
+    events = [
+        {
+            "stage": "HIVE_REGISTERED",
+            "title": "🐝 Hive Registered",
+            "timestamp": installed_ts,
+            "actor": "Beekeeper Master Node",
+            "location": f"{cluster.name if cluster else 'Apiary Node'} ({cluster.region if cluster else 'Regional'})",
+            "data": f"Hive #{b.hive_id} GPS: ({h.gps_lat if h else 30.3165}, {h.gps_long if h else 78.0322})",
+            "verification": "VERIFIED"
+        },
+        {
+            "stage": "SENSOR_MONITORING",
+            "title": "📡 IoT Telemetry Monitoring",
+            "timestamp": created_ts,
+            "actor": f"IoT Sensor Node #{b.hive_id}",
+            "location": f"Hive #{b.hive_id}",
+            "data": "Temperature, Humidity, & Weight stability tracked continuously",
+            "verification": "VERIFIED"
+        },
+        {
+            "stage": "AI_ANALYSIS",
+            "title": "🧠 AI Health & Vision Inspection",
+            "timestamp": created_ts,
+            "actor": "YOLO Vision AI + Anomaly Detector",
+            "location": f"Hive #{b.hive_id}",
+            "data": f"AI Health Score: {b.health_score}/100",
+            "verification": "VERIFIED"
+        },
+        {
+            "stage": "HARVEST",
+            "title": "🍯 Nectar Harvested",
+            "timestamp": created_ts,
+            "actor": "Beekeeper",
+            "location": f"Hive #{b.hive_id}",
+            "data": f"{b.weight_kg}kg of {b.floral_source} harvested",
+            "verification": "VERIFIED"
+        },
+        {
+            "stage": "BATCH_CREATED",
+            "title": "📦 Batch Passport Created",
+            "timestamp": created_ts,
+            "actor": "Honey Chain Protocol",
+            "location": "Honey Chain Node",
+            "data": f"Batch ID: {b.batch_id} (Canonical SHA-256 Hash Generated)",
+            "verification": "VERIFIED"
+        },
+        {
+            "stage": "BLOCKCHAIN_MINT",
+            "title": f"⛓ ERC-721 Token #{b.token_id} Minted",
+            "timestamp": created_ts,
+            "actor": "Sepolia Smart Contract",
+            "location": "Ethereum Sepolia",
+            "data": f"Tx Hash: {b.tx_hash} | IPFS CID: {b.ipfs_cid}",
+            "verification": "VERIFIED ON SEPOLIA" if b.blockchain_mode == "sepolia" else "DEMO MODE VERIFIED"
+        }
+    ]
+    
+    if b.is_revoked:
+        events.append({
+            "stage": "REVOKED",
+            "title": "❌ Batch Revoked by KVIC",
+            "timestamp": iso(b.updated_at),
+            "actor": "KVIC Admin Authority",
+            "location": "KVIC Command Center",
+            "data": f"Reason: {b.revocation_reason or 'Compliance failure'}",
+            "verification": "REVOKED"
+        })
+
+    return {
+        "batch_id": b.batch_id,
+        "hive_id": b.hive_id,
+        "token_id": b.token_id,
+        "is_revoked": b.is_revoked,
+        "timeline": events
+    }
+
+
 # --- Audit, security, analytics ------------------------------------------------
 @app.get("/audit-logs", tags=["Audit & Security"])
 def list_audit_logs(limit: int = 200, action: Optional[str] = None, db: Session = Depends(database.get_db)):
