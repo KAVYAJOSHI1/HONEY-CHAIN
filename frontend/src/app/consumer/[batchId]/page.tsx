@@ -7,7 +7,7 @@ import {
 import { api } from "@/lib/api";
 import { formatDate, formatDateTime, shortHash } from "@/lib/format";
 import { scoreTone, toneClasses } from "@/lib/status";
-import type { Batch, Integrity, TimelineEvent } from "@/lib/types";
+import type { Batch, Integrity, TimelineEvent, TimelineResponse } from "@/lib/types";
 import { Logo } from "@/components/Logo";
 import { Button } from "@/components/ui/Button";
 import { CopyButton } from "@/components/ui/CopyButton";
@@ -75,10 +75,11 @@ export default function PassportPage({ params }: { params: { batchId: string } }
     try {
       const [b, t] = await Promise.all([
         api.get<Batch>(`/batches/${encodeURIComponent(batchId)}`),
-        api.get<TimelineEvent[]>(`/batches/${encodeURIComponent(batchId)}/timeline`),
+        api.get<TimelineResponse | TimelineEvent[]>(`/batches/${encodeURIComponent(batchId)}/timeline`),
       ]);
       setBatch(b);
-      setTimeline(t);
+      const list = Array.isArray(t) ? t : (t?.timeline || []);
+      setTimeline(list);
       setIntegrity(await api.post<Integrity>(`/batches/${encodeURIComponent(batchId)}/verify-integrity`));
       setError(null);
     } catch (e) {
@@ -175,18 +176,19 @@ export default function PassportPage({ params }: { params: { batchId: string } }
             <section className="card p-6">
               <h2 className="mb-5 text-sm font-semibold">Journey from hive to jar</h2>
               <ol className="relative space-y-6 before:absolute before:bottom-2 before:left-[15px] before:top-2 before:w-px before:bg-line-strong">
-                {timeline.map((e) => {
-                  const Icon = EVENT_ICONS[e.key] ?? CheckCircle2;
-                  const bad = e.key === "revoked";
+                {(timeline || []).map((e: TimelineEvent, idx: number) => {
+                  const stageKey = (e.key || e.stage || "").toString().toLowerCase();
+                  const Icon = EVENT_ICONS[stageKey] ?? (e.key ? EVENT_ICONS[e.key] : CheckCircle2);
+                  const bad = stageKey === "revoked";
                   return (
-                    <li key={e.key} className="relative flex gap-4">
+                    <li key={e.key || e.stage || idx} className="relative flex gap-4">
                       <span className={`relative z-10 flex h-8 w-8 shrink-0 items-center justify-center rounded-full border ${bad ? "border-critical/40 bg-critical/15 text-critical" : "border-line-strong bg-surface-2 text-brand"}`}>
                         <Icon className="h-4 w-4" />
                       </span>
                       <div className="min-w-0 pt-1">
                         <p className="text-sm font-medium">{e.title}</p>
                         <p className="text-xs text-ink-3">{formatDateTime(e.timestamp)}</p>
-                        <p className="mt-1 text-sm text-ink-2 [overflow-wrap:anywhere]">{e.detail}</p>
+                        <p className="mt-1 text-sm text-ink-2 [overflow-wrap:anywhere]">{e.detail || e.data}</p>
                       </div>
                     </li>
                   );
