@@ -1,36 +1,28 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import localFont from "next/font/local";
 import "./globals.css";
 import HoneyBot from "@/components/HoneyBot";
+import { ToastProvider } from "@/components/ui/Toast";
 
-const geistSans = localFont({
-  src: "./fonts/GeistVF.woff",
-  variable: "--font-geist-sans",
-  weight: "100 900",
-});
-const geistMono = localFont({
-  src: "./fonts/GeistMonoVF.woff",
-  variable: "--font-geist-mono",
-  weight: "100 900",
-});
+const geistSans = localFont({ src: "./fonts/GeistVF.woff", variable: "--font-geist-sans", weight: "100 900" });
+const geistMono = localFont({ src: "./fonts/GeistMonoVF.woff", variable: "--font-geist-mono", weight: "100 900" });
 
 export const metadata: Metadata = {
-  title: "Honey Chain | Decentralized Traceability & Smart Beekeeping",
-  description: "Real-time IoT telemetry, AI YOLO colony health analytics, and Sepolia ERC-721 immutable honey provenance ledger.",
+  title: { default: "Honey Chain — Honey traceability & smart beekeeping", template: "%s · Honey Chain" },
+  description: "IoT hive telemetry, AI colony health analytics and blockchain-anchored honey provenance for beekeepers, KVIC and consumers.",
+  icons: { icon: "/icon.svg" },
 };
 
-export default function RootLayout({
-  children,
-}: Readonly<{
-  children: React.ReactNode;
-}>) {
+export const viewport: Viewport = { themeColor: "#111110" };
+
+export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
     <html lang="en">
-      <body
-        className={`${geistSans.variable} ${geistMono.variable} antialiased bg-slate-950`}
-      >
-        {children}
-        <HoneyBot />
+      <body className={`${geistSans.variable} ${geistMono.variable} font-sans antialiased`}>
+        <ToastProvider>
+          {children}
+          <HoneyBot />
+        </ToastProvider>
       </body>
     </html>
   );

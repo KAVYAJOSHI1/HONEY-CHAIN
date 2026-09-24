@@ -1,135 +1,126 @@
 "use client";
-import { useState } from 'react';
+import { useEffect, useRef, useState, type FormEvent } from "react";
+import { usePathname } from "next/navigation";
+import { Bot, Loader2, Send, X } from "lucide-react";
+import { api } from "@/lib/api";
 
-interface HoneyBotProps {
-  hiveId?: string;
-}
+interface Message { sender: "user" | "bot"; text: string }
 
-export default function HoneyBot({ hiveId }: HoneyBotProps) {
-  const [isOpen, setIsOpen] = useState(false);
-  const [query, setQuery] = useState('');
-  const [messages, setMessages] = useState<Array<{ sender: 'user' | 'bot'; text: string }>>([
-    { sender: 'bot', text: `Bzzzt! I am HoneyBot AI 🐝. Ask me anything about hive health, harvest predictions, Varroa treatments, or blockchain verification!` }
-  ]);
+const INITIAL_CHIPS = ["Unhealthy hives", "Harvest ready", "Varroa risk", "Today's alerts", "Batch verification"];
+
+export default function HoneyBot() {
+  const pathname = usePathname();
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(false);
+  const [chips, setChips] = useState(INITIAL_CHIPS);
+  const [messages, setMessages] = useState<Message[]>([
+    { sender: "bot", text: "Hi — I'm HoneyBot. Ask about hive health, Varroa risk, harvest readiness, open alerts, batch verification, or a specific hive (e.g. “hive 4”)." },
+  ]);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
 
-  const [chips, setChips] = useState<string[]>(["Unhealthy Hives", "Harvest Ready", "Varroa Risk", "Today's Alerts", "Batch Verification"]);
+  useEffect(() => {
+    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
+  }, [messages, loading]);
 
-  const sendQuery = async (queryText: string) => {
-    if (!queryText.trim()) return;
+  useEffect(() => {
+    if (open) inputRef.current?.focus();
+  }, [open]);
 
-    setMessages(prev => [...prev, { sender: 'user', text: queryText }]);
-    setQuery('');
+  // Operator assistant — not shown on public consumer pages.
+  if (pathname === "/" || pathname.startsWith("/consumer") || pathname.startsWith("/verify")) return null;
+
+  const send = async (text: string) => {
+    const q = text.trim();
+    if (!q || loading) return;
+    setMessages((m) => [...m, { sender: "user", text: q }]);
+    setQuery("");
     setLoading(true);
-
     try {
-      const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
-      const res = await fetch(`${apiUrl}/honeybot/query`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query: queryText })
-      });
-      if (res.ok) {
-        const data = await res.json();
-        setMessages(prev => [...prev, { sender: 'bot', text: data.reply }]);
-        if (data.chips) setChips(data.chips);
-      } else {
-        setMessages(prev => [...prev, { sender: 'bot', text: "Apologies, I encountered an issue querying the hive intelligence network." }]);
-      }
-    } catch {
-      setMessages(prev => [...prev, { sender: 'bot', text: "Apologies, I had trouble connecting to the hive intelligence node." }]);
+      const data = await api.post<{ reply: string; chips?: string[] }>("/honeybot/query", { query: q });
+      setMessages((m) => [...m, { sender: "bot", text: data.reply }]);
+      if (data.chips?.length) setChips(data.chips);
+    } catch (e) {
+      setMessages((m) => [...m, { sender: "bot", text: e instanceof Error ? e.message : "Something went wrong." }]);
     } finally {
       setLoading(false);
     }
   };
 
-  const handleSend = (e: React.FormEvent) => {
+  const onSubmit = (e: FormEvent) => {
     e.preventDefault();
-    sendQuery(query);
+    send(query);
   };
 
+  if (!open) {
+    return (
+      <button
+        onClick={() => setOpen(true)}
+        className="no-print fixed bottom-5 right-5 z-[900] flex h-12 items-center gap-2 rounded-full border border-brand/40 bg-surface-2 pl-3 pr-4 text-sm font-medium text-ink shadow-pop transition hover:border-brand"
+        aria-label="Open HoneyBot assistant"
+      >
+        <span className="flex h-7 w-7 items-center justify-center rounded-full bg-brand text-canvas">
+          <Bot className="h-4 w-4" />
+        </span>
+        <span className="hidden sm:inline">Ask HoneyBot</span>
+      </button>
+    );
+  }
+
   return (
-    <div className="fixed bottom-6 right-6 z-50">
-      {/* Floating Toggle Button */}
-      {!isOpen && (
-        <button
-          onClick={() => setIsOpen(true)}
-          className="bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 text-slate-950 font-extrabold px-4 py-3 rounded-full shadow-2xl flex items-center space-x-2 border-2 border-amber-300 transition-all hover:scale-105"
-        >
-          <span className="text-xl">🐝</span>
-          <span className="text-xs tracking-wide uppercase">HoneyBot AI</span>
-          <span className="w-2.5 h-2.5 rounded-full bg-emerald-950 animate-ping"></span>
-        </button>
-      )}
-
-      {/* Chat Window */}
-      {isOpen && (
-        <div className="w-80 sm:w-96 bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl overflow-hidden flex flex-col h-[460px] animate-in fade-in slide-in-from-bottom-4">
-          
-          {/* Header */}
-          <div className="bg-slate-950 p-4 border-b border-slate-800 flex justify-between items-center">
-            <div className="flex items-center space-x-2">
-              <span className="text-xl">🐝</span>
-              <div>
-                <h3 className="text-xs font-extrabold text-amber-400 uppercase tracking-wider">HoneyBot AI Assistant</h3>
-                <span className="text-[10px] text-emerald-400 font-mono">Apiary Knowledge Engine Active</span>
-              </div>
-            </div>
-            <button 
-              onClick={() => setIsOpen(false)}
-              className="text-slate-400 hover:text-white text-sm font-bold px-2 py-1 rounded"
-            >
-              ✕
-            </button>
-          </div>
-
-          {/* Messages Feed */}
-          <div className="flex-1 p-4 overflow-y-auto space-y-3 text-xs">
-            {messages.map((m, idx) => (
-              <div key={idx} className={`flex ${m.sender === 'user' ? 'justify-end' : 'justify-start'}`}>
-                <div className={`max-w-[85%] p-3 rounded-2xl ${m.sender === 'user' ? 'bg-amber-500 text-slate-950 font-semibold rounded-tr-none' : 'bg-slate-950 text-slate-200 border border-slate-800 rounded-tl-none leading-relaxed'}`}>
-                  {m.text}
-                </div>
-              </div>
-            ))}
-            {loading && (
-              <div className="flex justify-start">
-                <div className="bg-slate-950 p-3 rounded-2xl text-amber-400 border border-slate-800 text-xs font-mono animate-pulse">
-                  HoneyBot is analyzing colony metrics...
-                </div>
-              </div>
-            )}
-          </div>
-
-          {/* Prompt Suggestion Chips */}
-          <div className="px-3 py-2 bg-slate-950/60 border-t border-slate-800/80 flex space-x-1.5 overflow-x-auto text-[10px] no-scrollbar">
-            {chips.map((chip, idx) => (
-              <button 
-                key={idx}
-                onClick={() => sendQuery(chip)} 
-                className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-amber-300 border border-slate-700 rounded-md whitespace-nowrap transition-colors"
-              >
-                {chip}
-              </button>
-            ))}
-          </div>
-
-          {/* Input Bar */}
-          <form onSubmit={handleSend} className="p-3 bg-slate-950 border-t border-slate-800 flex space-x-2">
-            <input
-              type="text"
-              value={query}
-              onChange={e => setQuery(e.target.value)}
-              placeholder="Ask HoneyBot AI..."
-              className="flex-1 bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-xs text-slate-100 focus:border-amber-500 outline-none"
-            />
-            <button type="submit" className="px-3 py-2 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs rounded-xl">
-              Send
-            </button>
-          </form>
-
+    <div className="no-print fixed inset-x-3 bottom-3 z-[900] flex h-[min(520px,80vh)] animate-fade-in flex-col overflow-hidden rounded-2xl border border-line bg-surface shadow-pop sm:inset-x-auto sm:right-5 sm:w-96">
+      <div className="flex items-center gap-3 border-b border-line px-4 py-3">
+        <span className="flex h-8 w-8 items-center justify-center rounded-full bg-brand text-canvas">
+          <Bot className="h-4 w-4" />
+        </span>
+        <div className="min-w-0 flex-1">
+          <p className="text-sm font-semibold">HoneyBot</p>
+          <p className="text-xs text-ink-3">Answers from live apiary data</p>
         </div>
-      )}
+        <button onClick={() => setOpen(false)} className="rounded-md p-1 text-ink-3 hover:bg-surface-2 hover:text-ink" aria-label="Close HoneyBot">
+          <X className="h-4 w-4" />
+        </button>
+      </div>
+
+      <div ref={scrollRef} className="flex-1 space-y-3 overflow-y-auto p-4 text-sm" aria-live="polite">
+        {messages.map((m, i) => (
+          <div key={i} className={`flex ${m.sender === "user" ? "justify-end" : "justify-start"}`}>
+            <div
+              className={`max-w-[88%] whitespace-pre-line rounded-2xl px-3 py-2 leading-relaxed ${
+                m.sender === "user" ? "rounded-br-sm bg-brand text-canvas" : "rounded-bl-sm border border-line bg-surface-2 text-ink-2"
+              }`}
+            >
+              {m.text}
+            </div>
+          </div>
+        ))}
+        {loading && (
+          <div className="flex items-center gap-2 text-xs text-ink-3">
+            <Loader2 className="h-3.5 w-3.5 animate-spin" /> Analyzing apiary data…
+          </div>
+        )}
+      </div>
+
+      <div className="flex gap-1.5 overflow-x-auto border-t border-line px-3 py-2">
+        {chips.map((chip) => (
+          <button
+            key={chip}
+            onClick={() => send(chip)}
+            disabled={loading}
+            className="whitespace-nowrap rounded-full border border-line-strong px-2.5 py-1 text-xs text-ink-2 hover:border-brand/60 hover:text-ink disabled:opacity-50"
+          >
+            {chip}
+          </button>
+        ))}
+      </div>
+
+      <form onSubmit={onSubmit} className="flex gap-2 border-t border-line p-3">
+        <input ref={inputRef} value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Ask about your hives…" className="input" aria-label="Message HoneyBot" maxLength={500} />
+        <button type="submit" disabled={loading || !query.trim()} className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-brand text-canvas disabled:opacity-40" aria-label="Send">
+          <Send className="h-4 w-4" />
+        </button>
+      </form>
     </div>
   );
 }

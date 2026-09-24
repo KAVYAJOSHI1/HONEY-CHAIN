@@ -1,13 +1,16 @@
 {
   "name": "blockchain",
   "version": "1.0.0",
-  "description": "",
+  "description": "HoneyBatch ERC-721 provenance contract",
   "main": "index.js",
   "directories": {
     "test": "test"
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "deploy:local": "hardhat run scripts/deploy.js",
+    "deploy:sepolia": "hardhat run scripts/deploy.js --network sepolia"
   },
   "keywords": [],
   "author": "",

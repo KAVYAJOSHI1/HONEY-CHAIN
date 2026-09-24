@@ -57,6 +57,7 @@ class Batch(Base):
     token_id = Column(String)
     ipfs_cid = Column(String)
     tx_hash = Column(String)
+    data_hash = Column(String, nullable=True)  # SHA-256 of the canonical batch record at mint time
     health_score = Column(Float)
     floral_source = Column(String, default="Wildflower Honey")
     weight_kg = Column(Float, default=32.5)

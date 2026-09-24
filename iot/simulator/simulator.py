@@ -1,83 +1,94 @@
-import time
-import random
-import json
-import urllib.request
-import threading
+"""ESP32 hive sensor simulator — posts temperature / humidity / weight readings to the backend.
+
+Examples:
+  python simulator.py                                   # NORMAL readings for hive 1 every 10 s
+  python simulator.py --scenario HIGH_TEMPERATURE --hives 4
+  python simulator.py --scenario DEMO_MODE --hives 1,2,3 --interval 3
+Environment:
+  API_URL  telemetry endpoint (default http://localhost:8000/telemetry)
+"""
 import argparse
+import json
+import os
+import random
+import time
+import urllib.error
+import urllib.request
 
-API_URL = "http://localhost:8000/telemetry"
-HIVE_ID = "1"
+API_URL = os.getenv("API_URL", "http://localhost:8000/telemetry")
 
-def simulate_telemetry(scenario="NORMAL"):
-    """Generates and sends simulated ESP32 sensor data to the backend."""
-    # Base values
-    temp_base = 34.5
-    hum_base = 50.0
-    weight_base = 25.0
-    
-    if scenario == "HIGH_TEMPERATURE":
-        temp_base = 38.0
-    elif scenario == "HIGH_HUMIDITY":
-        hum_base = 70.0
-    elif scenario == "WEIGHT_INCREASE":
-        weight_base = 31.0
-    elif scenario == "WEIGHT_DROP":
-        weight_base = 15.0
-    elif scenario == "ABNORMAL_HIVE":
-        temp_base = 38.0
-        hum_base = 75.0
-        weight_base = 10.0
+SCENARIOS = {
+    # scenario: (temp base, humidity base, weight base, weight drift per tick)
+    "NORMAL": (34.5, 52.0, 25.0, 0.05),
+    "HIGH_TEMPERATURE": (38.2, 52.0, 25.0, 0.0),
+    "HIGH_HUMIDITY": (34.5, 71.0, 25.0, 0.0),
+    "WEIGHT_INCREASE": (34.5, 52.0, 29.0, 0.4),
+    "WEIGHT_DROP": (34.5, 52.0, 26.0, -1.5),
+    "ABNORMAL_HIVE": (38.5, 76.0, 20.0, -1.2),
+    "DEVICE_OFFLINE": None,
+    "DEMO_MODE": (34.5, 52.0, 27.0, 0.5),
+}
 
-    print(f"Running scenario: {scenario}")
-    
+
+def post(payload: dict) -> str:
+    req = urllib.request.Request(API_URL, data=json.dumps(payload).encode(), method="POST",
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=10) as res:
+        body = json.loads(res.read() or b"{}")
+        return f"{res.status} alerts={body.get('alerts_generated', 0)} status={body.get('hive_status', '?')}"
+
+
+def last_weight(hive_id: int):
+    """Start from the hive's real scale reading so the first sample isn't a fake weight jump."""
+    base = API_URL.rsplit("/telemetry", 1)[0]
+    try:
+        with urllib.request.urlopen(f"{base}/hives/{hive_id}", timeout=10) as res:
+            return json.loads(res.read()).get("latest_weight")
+    except Exception:
+        return None
+
+
+def run(scenario: str, hive_ids: list, interval: float):
+    params = SCENARIOS[scenario]
+    print(f"Simulating {scenario} for hives {hive_ids} -> {API_URL}")
+    default = params[2] if params else 25.0
+    # Scenarios that set an explicit weight profile keep it; others continue from the real weight.
+    keep_profile = scenario in ("WEIGHT_INCREASE", "WEIGHT_DROP", "ABNORMAL_HIVE")
+    weights = {h: default if keep_profile else (last_weight(h) or default) for h in hive_ids}
+
     while True:
-        # Simulate realistic hive metrics with jitter
-        payload = {
-            "hive_id": HIVE_ID,
-            "temperature": round(random.uniform(temp_base - 1.0, temp_base + 1.0), 2),
-            "humidity": round(random.uniform(hum_base - 5.0, hum_base + 5.0), 2),
-            "weight": round(random.uniform(weight_base - 0.5, weight_base + 0.5), 2),
-            "timestamp": int(time.time())
-        }
-        
-        # Introduce occasional anomalies in NORMAL mode
-        if scenario == "NORMAL" and random.random() < 0.05:
-            payload["temperature"] += 10.0 # Heat spike anomaly
-            
-        if scenario == "DEVICE_OFFLINE":
-            print("Device is offline. Not sending data.")
-            time.sleep(10)
+        if params is None:
+            print("Device offline — no readings sent.")
+            time.sleep(interval)
             continue
-            
-        if scenario == "DEMO_MODE":
-            payload["weight"] = round(weight_base, 2)
-            weight_base += 0.5
-            if weight_base >= 31.0:
-                print("Harvest threshold crossed! Triggering AI scan and Batch creation on backend...")
-                # We could hit other endpoints here, but just simulating weight is enough for Harvest Ready.
-                # Let's pause at 31.5 to allow the demo to show the Harvest Ready state
-                if weight_base > 31.5:
-                    weight_base = 31.5
 
-        try:
-            req = urllib.request.Request(API_URL, method="POST")
-            req.add_header('Content-Type', 'application/json')
-            data = json.dumps(payload).encode('utf-8')
-            
-            with urllib.request.urlopen(req, data=data) as response:
-                print(f"Sent: {payload} | Status: {response.status}")
-                
-        except Exception as e:
-            print(f"Failed to send {payload} | Error: {e}")
-            
-        time.sleep(10 if scenario != "DEMO_MODE" else 3) # Faster updates for demo mode
+        temp_base, hum_base, _, drift = params
+        for hive_id in hive_ids:
+            weights[hive_id] = max(5.0, weights[hive_id] + drift + random.uniform(-0.05, 0.05))
+            if scenario == "DEMO_MODE" and weights[hive_id] > 31.5:
+                weights[hive_id] = 31.5  # hold at harvest-ready so the demo can show it
+            temp = random.uniform(temp_base - 0.5, temp_base + 0.5)
+            if scenario == "NORMAL" and random.random() < 0.03:
+                temp += 4.0  # occasional heat spike for the anomaly detector
+            payload = {
+                "hive_id": hive_id,
+                "temperature": round(temp, 1),
+                "humidity": round(random.uniform(hum_base - 2.0, hum_base + 2.0), 1),
+                "weight": round(weights[hive_id], 1),
+            }
+            try:
+                print(f"hive {hive_id}: {payload} -> {post(payload)}")
+            except urllib.error.HTTPError as exc:
+                print(f"hive {hive_id}: rejected ({exc.code}) {exc.read().decode(errors='ignore')}")
+            except Exception as exc:
+                print(f"hive {hive_id}: backend unreachable ({exc}); retrying")
+        time.sleep(interval)
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="IoT Hive Simulator")
-    parser.add_argument("--scenario", type=str, default="NORMAL", 
-                        choices=["NORMAL", "HIGH_TEMPERATURE", "HIGH_HUMIDITY", "WEIGHT_INCREASE", "WEIGHT_DROP", "DEVICE_OFFLINE", "ABNORMAL_HIVE", "DEMO_MODE"],
-                        help="The demo scenario to run")
+    parser = argparse.ArgumentParser(description="IoT hive simulator")
+    parser.add_argument("--scenario", default="NORMAL", choices=list(SCENARIOS))
+    parser.add_argument("--hives", default=os.getenv("HIVE_IDS", "1"), help="Comma-separated hive ids (default 1)")
+    parser.add_argument("--interval", type=float, default=float(os.getenv("INTERVAL", "10")), help="Seconds between readings")
     args = parser.parse_args()
-    
-    print(f"Starting IoT simulator for hive {HIVE_ID}...")
-    simulate_telemetry(args.scenario)
+    run(args.scenario, [int(h) for h in args.hives.split(",") if h.strip()], args.interval)

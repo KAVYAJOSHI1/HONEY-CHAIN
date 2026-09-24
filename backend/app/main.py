@@ -1,1256 +1,1153 @@
-import os
-import uuid
-import hashlib
+import asyncio
 import csv
 import io
+import logging
+import os
+import random
 import time
+import uuid
+from collections import defaultdict
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
-from typing import List, Optional
+from typing import Optional
 
-from fastapi import FastAPI, Depends, HTTPException, File, UploadFile, Form, WebSocket, WebSocketDisconnect, Query
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, Response
-from sqlalchemy.orm import Session
-from sqlalchemy import func
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
+from sqlalchemy import func, or_, text
+from sqlalchemy.orm import Session
 
-import sys
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
+from . import database, models, utils
+from .ai.anomaly_detector import HiveAnomalyDetector
+from .ai.vision_model import InvalidImageError, vision_model
+from .intelligence import (
+    HARVEST_WEIGHT_KG, compute_health, compute_productivity, compute_recommendations, refresh_hive_status,
+)
+from .services import BLOCKCHAIN_MODE, IPFS_MODE, BlockchainService, IPFSService, canonical_hash
 
-try:
-    from ai.models.anomaly_detector import HiveAnomalyDetector
-    anomaly_detector = HiveAnomalyDetector()
-except Exception as e:
-    anomaly_detector = None
+logger = logging.getLogger("honeychain")
 
-from . import models, database
-from .ai.vision_model import vision_model
-from . import utils
-from .services import IPFSService, BlockchainService, BLOCKCHAIN_MODE
+OFFLINE_AFTER = timedelta(hours=24)
+MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
 
-# Initialize DB tables
-models.Base.metadata.create_all(bind=database.engine)
+anomaly_detector = HiveAnomalyDetector()
+anomaly_detector.train_on_baseline()
+
+database.migrate()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.loop = asyncio.get_running_loop()
+    if os.getenv("AUTO_SEED", "true").lower() == "true":
+        from .seed import seed_if_empty
+        if seed_if_empty():
+            logger.info("Empty database detected — demo dataset seeded.")
+    yield
+
 
 app = FastAPI(
-    title="Honey Chain V2 API",
-    description="AI-powered, IoT-enabled, blockchain-backed honey traceability and smart beekeeping platform.",
-    version="2.0.0"
+    title="Honey Chain API",
+    description="IoT-enabled, AI-assisted, blockchain-backed honey traceability and smart beekeeping platform.",
+    version="2.1.0",
+    lifespan=lifespan,
 )
 
-# Security Hardening: CORS
+_cors = os.getenv("CORS_ORIGINS", "*")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[o.strip() for o in _cors.split(",")] if _cors != "*" else ["*"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- WebSocket Connection Manager ---
+
+# --- Helpers -----------------------------------------------------------------
+def iso(dt: Optional[datetime]) -> Optional[str]:
+    """Timestamps are stored as naive UTC; mark them explicitly so browsers don't treat them as local."""
+    return dt.isoformat() + "Z" if dt else None
+
+
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: dict[str, list[WebSocket]] = {}
+        self.active: dict[str, list[WebSocket]] = defaultdict(list)
 
     async def connect(self, topic: str, websocket: WebSocket):
         await websocket.accept()
-        if topic not in self.active_connections:
-            self.active_connections[topic] = []
-        self.active_connections[topic].append(websocket)
+        self.active[topic].append(websocket)
 
     def disconnect(self, topic: str, websocket: WebSocket):
-        if topic in self.active_connections:
-            if websocket in self.active_connections[topic]:
-                self.active_connections[topic].remove(websocket)
+        if websocket in self.active.get(topic, []):
+            self.active[topic].remove(websocket)
 
     async def broadcast(self, topic: str, message: dict):
-        if topic in self.active_connections:
-            for connection in list(self.active_connections[topic]):
-                try:
-                    await connection.send_json(message)
-                except Exception:
-                    self.disconnect(topic, connection)
+        for connection in list(self.active.get(topic, [])):
+            try:
+                await connection.send_json(message)
+            except Exception:
+                self.disconnect(topic, connection)
+
+    def publish(self, topic: str, message: dict):
+        """Thread-safe broadcast from sync endpoints (which run in a worker thread)."""
+        loop = getattr(app.state, "loop", None)
+        if loop and self.active.get(topic):
+            asyncio.run_coroutine_threadsafe(self.broadcast(topic, message), loop)
+
 
 ws_manager = ConnectionManager()
 
-# --- Audit Log Helper ---
+
 def record_audit_log(db: Session, action: str, actor: str = "Beekeeper", details: str = "", blockchain_tx: Optional[str] = None):
     try:
-        log = models.AuditLog(
-            action=action,
-            actor=actor,
-            details=details,
-            blockchain_tx=blockchain_tx,
-            timestamp=datetime.utcnow()
-        )
-        db.add(log)
+        db.add(models.AuditLog(action=action, actor=actor, details=details, blockchain_tx=blockchain_tx, timestamp=datetime.utcnow()))
         db.commit()
-        return log
     except Exception:
         db.rollback()
-        return None
 
-# --- Security Event Helper ---
+
 def record_security_event(db: Session, event_type: str, severity: str = "LOW", description: str = "", actor: str = "System"):
     try:
-        sec = models.SecurityEvent(
-            event_type=event_type,
-            severity=severity,
-            description=description,
-            actor=actor,
-            timestamp=datetime.utcnow()
-        )
-        db.add(sec)
+        db.add(models.SecurityEvent(event_type=event_type, severity=severity, description=description, actor=actor, timestamp=datetime.utcnow()))
         db.commit()
-        return sec
     except Exception:
         db.rollback()
-        return None
 
-# --- Pydantic Schemas ---
+
+def get_hive_or_404(db: Session, hive_id: int) -> models.Hive:
+    hive = db.query(models.Hive).filter(models.Hive.id == hive_id).first()
+    if not hive:
+        raise HTTPException(status_code=404, detail=f"Hive #{hive_id} not found")
+    return hive
+
+
+def get_batch_or_404(db: Session, batch_id: str) -> models.Batch:
+    batch = db.query(models.Batch).filter(models.Batch.batch_id == batch_id).first()
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    return batch
+
+
+def latest_telemetry(db: Session, hive_id: int) -> Optional[models.Telemetry]:
+    return (
+        db.query(models.Telemetry)
+        .filter(models.Telemetry.hive_id == hive_id)
+        .order_by(models.Telemetry.timestamp.desc())
+        .first()
+    )
+
+
+def batch_canonical_string(hive_id, floral_source, weight, health_score) -> str:
+    return f"{hive_id}_{floral_source}_{float(weight)}_{float(health_score)}"
+
+
+def integrity_of(batch: models.Batch) -> dict:
+    score = batch.tampered_health_score if batch.tampered_health_score is not None else batch.health_score
+    current_hash = canonical_hash(batch_canonical_string(batch.hive_id, batch.floral_source or "Wildflower", batch.weight_kg or 0, score))
+    # On-chain batches keep the data hash separately; demo batches use the hash itself as the anchor.
+    anchored_hash = batch.data_hash if (batch.blockchain_mode == "sepolia" and batch.data_hash) else batch.tx_hash
+    hash_ok = current_hash == anchored_hash
+    verified = hash_ok and batch.tampered_health_score is None and not batch.is_revoked
+    if verified:
+        status = "Authentic"
+    elif batch.is_revoked:
+        status = "REVOKED"
+    else:
+        status = "Integrity Mismatch Detected"
+    return {
+        "verified": verified,
+        "current_hash": current_hash,
+        "anchored_hash": anchored_hash,
+        "is_tampered": (batch.tampered_health_score is not None) or not hash_ok,
+        "is_revoked": batch.is_revoked,
+        "revocation_reason": batch.revocation_reason,
+        "status": status,
+    }
+
+
+def serialize_batch(db: Session, b: models.Batch, include_origin: bool = True) -> dict:
+    data = {
+        "id": b.id,
+        "batch_id": b.batch_id,
+        "hive_id": b.hive_id,
+        "token_id": b.token_id,
+        "ipfs_cid": b.ipfs_cid,
+        "tx_hash": b.tx_hash,
+        "data_hash": b.data_hash,
+        "health_score": b.health_score,
+        "floral_source": b.floral_source,
+        "weight_kg": b.weight_kg,
+        "tampered_health_score": b.tampered_health_score,
+        "is_revoked": b.is_revoked,
+        "revocation_reason": b.revocation_reason,
+        "blockchain_mode": b.blockchain_mode,
+        "created_at": iso(b.created_at),
+        "updated_at": iso(b.updated_at),
+        "verification_url": utils.verification_url(b.batch_id),
+    }
+    if include_origin:
+        hive = db.query(models.Hive).filter(models.Hive.id == b.hive_id).first()
+        cluster = hive.cluster if hive else None
+        owner = hive.owner if hive else None
+        data["origin"] = {
+            "hive_id": b.hive_id,
+            "apiary": cluster.name if cluster else None,
+            "region": cluster.region if cluster else None,
+            "gps_lat": hive.gps_lat if hive else None,
+            "gps_long": hive.gps_long if hive else None,
+            "beekeeper": owner.name if owner else None,
+        }
+    return data
+
+
+def serialize_alert(a: models.Alert) -> dict:
+    return {
+        "id": a.id,
+        "hive_id": a.hive_id,
+        "type": a.type or "ANOMALY",
+        "severity": a.severity,
+        "reason": a.reason,
+        "message": a.message,
+        "source": a.source,
+        "current_value": a.current_value,
+        "acknowledged": bool(a.acknowledged),
+        "resolved": bool(a.resolved),
+        "timestamp": iso(a.timestamp),
+    }
+
+
+def serialize_telemetry(t: models.Telemetry) -> dict:
+    return {"id": t.id, "hive_id": t.hive_id, "temperature": t.temperature, "humidity": t.humidity, "weight": t.weight, "timestamp": iso(t.timestamp)}
+
+
+def serialize_analysis(a: models.AIAnalysis) -> dict:
+    return {
+        "id": a.id, "hive_id": a.hive_id, "health_score": a.health_score, "infection_rate": a.infection_rate,
+        "varroa_count": a.varroa_count, "healthy_bee_count": a.healthy_bee_count, "image_ref": a.image_ref, "timestamp": iso(a.timestamp),
+    }
+
+
+def hive_summary(db: Session, h: models.Hive) -> dict:
+    tel = latest_telemetry(db, h.id)
+    health = compute_health(db, h.id)
+    last_seen = tel.timestamp if tel else None
+    return {
+        "id": h.id,
+        "owner_id": h.owner_id,
+        "cluster_id": h.cluster_id,
+        "cluster_name": h.cluster.name if h.cluster else None,
+        "region": h.cluster.region if h.cluster else None,
+        "gps_lat": h.gps_lat,
+        "gps_long": h.gps_long,
+        "status": health["status"],
+        "health_score": health["health_score"],
+        "installed_at": iso(h.installed_at),
+        "latest_temperature": tel.temperature if tel else None,
+        "latest_humidity": tel.humidity if tel else None,
+        "latest_weight": tel.weight if tel else None,
+        "harvest_ready": bool(tel and tel.weight >= HARVEST_WEIGHT_KG),
+        "last_seen": iso(last_seen),
+        "online": bool(last_seen and datetime.utcnow() - last_seen < OFFLINE_AFTER),
+    }
+
+
+# --- Schemas -----------------------------------------------------------------
 class TelemetryCreate(BaseModel):
     hive_id: int
-    temperature: float
-    humidity: float
-    weight: float
+    temperature: float = Field(..., ge=-20, le=70)
+    humidity: float = Field(..., ge=0, le=100)
+    weight: float = Field(..., ge=0, le=200)
+
 
 class ScenarioSimulateRequest(BaseModel):
     hive_id: int = 1
     scenario: str = "NORMAL"
 
+
 class TamperBatchRequest(BaseModel):
     tampered_score: float = 35.0
+
 
 class HiveCreate(BaseModel):
     owner_id: int
     cluster_id: int
-    gps_lat: float
-    gps_long: float
+    gps_lat: float = Field(..., ge=-90, le=90)
+    gps_long: float = Field(..., ge=-180, le=180)
+
 
 class BatchCreate(BaseModel):
     hive_id: int
-    floral_source: str
-    weight: float
+    floral_source: str = Field(..., min_length=2, max_length=80)
+    weight: float = Field(..., gt=0, le=500)
     health_score: float = Field(..., ge=1, le=100)
 
+
 class RevokeRequest(BaseModel):
-    reason: str
+    reason: str = Field(..., min_length=3, max_length=300)
 
-class AlertResponse(BaseModel):
-    id: int
-    hive_id: int
-    type: Optional[str] = "ANOMALY"
-    severity: str
-    reason: str
-    message: Optional[str] = None
-    source: Optional[str] = "SYSTEM"
-    current_value: Optional[float] = None
-    acknowledged: bool = False
-    resolved: bool = False
-    timestamp: datetime
-
-    class Config:
-        orm_mode = True
-        from_attributes = True
-
-class AIAnalysisResponse(BaseModel):
-    id: int
-    hive_id: int
-    health_score: float
-    infection_rate: float
-    varroa_count: int
-    healthy_bee_count: int
-    image_ref: Optional[str] = None
-    timestamp: datetime
-    
-    class Config:
-        orm_mode = True
-
-class NotificationResponse(BaseModel):
-    id: int
-    message: str
-    is_read: bool
-    timestamp: datetime
-    
-    class Config:
-        orm_mode = True
 
 class HoneyBotRequest(BaseModel):
-    query: str
+    query: str = Field(..., min_length=1, max_length=500)
 
-# --- Core Routes ---
+
+# --- System ------------------------------------------------------------------
 @app.get("/", tags=["System"])
 def read_root():
     return {"message": "Welcome to the Honey Chain API"}
 
+
 @app.get("/system-health", tags=["System"])
 def system_health(db: Session = Depends(database.get_db)):
-    t0 = time.time()
-    db_status = "ONLINE"
-    last_telemetry_time = None
+    t0 = time.perf_counter()
+    db_status, last_tel = "ONLINE", None
     try:
-        db.execute("SELECT 1")
-        last_tel = db.query(models.Telemetry).order_by(models.Telemetry.timestamp.desc()).first()
-        if last_tel and last_tel.timestamp:
-            last_telemetry_time = last_tel.timestamp.isoformat()
+        db.execute(text("SELECT 1"))
+        tel = db.query(models.Telemetry).order_by(models.Telemetry.timestamp.desc()).first()
+        last_tel = iso(tel.timestamp) if tel else None
     except Exception:
         db_status = "OFFLINE"
-    
-    latency_ms = round((time.time() - t0) * 1000, 2)
-    
     return {
-        "frontend": "ONLINE",
         "backend": "ONLINE",
         "database": db_status,
-        "yolo_model": "LOADED" if vision_model is not None else "OFFLINE",
-        "isolation_forest": "READY" if anomaly_detector is not None else "OFFLINE",
+        "database_engine": database.engine.dialect.name,
+        "yolo_model": "LOADED" if vision_model.model_loaded else "OFFLINE",
+        "isolation_forest": "TRAINED" if anomaly_detector.is_trained else "RULE_FALLBACK",
         "blockchain_mode": BLOCKCHAIN_MODE.upper(),
-        "ipfs_mode": "MOCK",
+        "ipfs_mode": "MOCK" if IPFS_MODE != "real" else "LIVE",
         "websocket": "ONLINE",
-        "latency_ms": latency_ms,
-        "last_telemetry": last_telemetry_time or "N/A"
+        "websocket_clients": sum(len(v) for v in ws_manager.active.values()),
+        "latency_ms": round((time.perf_counter() - t0) * 1000, 2),
+        "last_telemetry": last_tel,
+        "version": app.version,
     }
 
-# --- Apiary & Hive Management ---
+
+@app.get("/stats/kpis", tags=["System"])
+def get_kpis(db: Session = Depends(database.get_db)):
+    open_alerts = db.query(models.Alert).filter(models.Alert.resolved == False).count()  # noqa: E712
+    critical = db.query(models.Alert).filter(models.Alert.resolved == False, models.Alert.severity == "CRITICAL").count()  # noqa: E712
+    hives = db.query(models.Hive).all()
+    harvest_ready = 0
+    for h in hives:
+        tel = latest_telemetry(db, h.id)
+        if tel and tel.weight >= HARVEST_WEIGHT_KG:
+            harvest_ready += 1
+    return {
+        "total_hives": len(hives),
+        "total_batches": db.query(models.Batch).count(),
+        "revoked_batches": db.query(models.Batch).filter(models.Batch.is_revoked == True).count(),  # noqa: E712
+        "alerts": open_alerts,
+        "critical_alerts": critical,
+        "harvest_ready_hives": harvest_ready,
+        "clusters": db.query(models.Cluster).count(),
+    }
+
+
+@app.get("/search", tags=["System"])
+def search(q: str, db: Session = Depends(database.get_db)):
+    q = q.strip()
+    term = q.lstrip("#")
+    hives = db.query(models.Hive).filter(models.Hive.id == int(term)).all() if term.isdigit() else []
+    batches = (
+        db.query(models.Batch)
+        .filter(or_(models.Batch.batch_id.ilike(f"%{q}%"), models.Batch.floral_source.ilike(f"%{q}%")))
+        .limit(8)
+        .all()
+    )
+    clusters = (
+        db.query(models.Cluster)
+        .filter(or_(models.Cluster.name.ilike(f"%{q}%"), models.Cluster.region.ilike(f"%{q}%")))
+        .limit(5)
+        .all()
+    )
+    return {
+        "hives": [{"id": h.id, "status": h.status, "cluster_name": h.cluster.name if h.cluster else None} for h in hives],
+        "batches": [{"id": b.id, "batch_id": b.batch_id, "floral_source": b.floral_source, "is_revoked": b.is_revoked} for b in batches],
+        "clusters": [{"id": c.id, "name": c.name, "region": c.region} for c in clusters],
+    }
+
+
+@app.post("/system/reset-demo", tags=["System"])
+def reset_demo_system():
+    from .seed import reset_db, seed_data
+    try:
+        database.engine.dispose()
+        reset_db()
+        seed_data()
+    except Exception as exc:
+        logger.exception("Demo reset failed")
+        raise HTTPException(status_code=500, detail=f"Reset failed: {exc}")
+    return {"status": "success", "message": "Database reset and demo data seeded."}
+
+
+@app.get("/notifications", tags=["System"])
+def get_notifications(db: Session = Depends(database.get_db)):
+    rows = db.query(models.Notification).order_by(models.Notification.timestamp.desc()).limit(50).all()
+    return [{"id": n.id, "message": n.message, "is_read": bool(n.is_read), "timestamp": iso(n.timestamp)} for n in rows]
+
+
+@app.post("/notifications/read-all", tags=["System"])
+def mark_notifications_read(db: Session = Depends(database.get_db)):
+    updated = db.query(models.Notification).filter(models.Notification.is_read == False).update({"is_read": True})  # noqa: E712
+    db.commit()
+    return {"updated": updated}
+
+
+# --- Apiaries & hives ----------------------------------------------------------
 @app.get("/clusters/", tags=["Apiaries"])
 def list_clusters(db: Session = Depends(database.get_db)):
-    clusters = db.query(models.Cluster).all()
-    res = []
-    for c in clusters:
-        hives = db.query(models.Hive).filter(models.Hive.cluster_id == c.id).all()
-        hive_ids = [h.id for h in hives]
-        
-        # Calculate stats for cluster
-        telemetries = db.query(models.Telemetry).filter(models.Telemetry.hive_id.in_(hive_ids)).all() if hive_ids else []
-        avg_temp = round(sum(t.temperature for t in telemetries) / len(telemetries), 1) if telemetries else 34.5
-        avg_hum = round(sum(t.humidity for t in telemetries) / len(telemetries), 1) if telemetries else 52.0
-        
-        healthy_cnt = sum(1 for h in hives if h.status == "ACTIVE")
-        warning_cnt = sum(1 for h in hives if h.status == "ATTENTION_REQUIRED")
-        critical_cnt = sum(1 for h in hives if h.status == "CRITICAL")
-        
-        res.append({
+    result = []
+    for c in db.query(models.Cluster).order_by(models.Cluster.id).all():
+        summaries = [hive_summary(db, h) for h in sorted(c.hives, key=lambda h: h.id)]
+        temps = [s["latest_temperature"] for s in summaries if s["latest_temperature"] is not None]
+        hums = [s["latest_humidity"] for s in summaries if s["latest_humidity"] is not None]
+        counts = defaultdict(int)
+        for s in summaries:
+            counts[s["status"]] += 1
+        result.append({
             "id": c.id,
             "name": c.name,
             "region": c.region,
-            "total_hives": len(hives),
-            "healthy": healthy_cnt,
-            "watch": 0,
-            "warning": warning_cnt,
-            "critical": critical_cnt,
-            "avg_temperature": avg_temp,
-            "avg_humidity": avg_hum,
-            "hives": [{"id": h.id, "status": h.status, "gps_lat": h.gps_lat, "gps_long": h.gps_long} for h in hives]
+            "total_hives": len(summaries),
+            "healthy": counts["HEALTHY"],
+            "watch": counts["WATCH"],
+            "warning": counts["WARNING"],
+            "critical": counts["CRITICAL"],
+            "avg_health": round(sum(s["health_score"] for s in summaries) / len(summaries)) if summaries else None,
+            "avg_temperature": round(sum(temps) / len(temps), 1) if temps else None,
+            "avg_humidity": round(sum(hums) / len(hums), 1) if hums else None,
+            "harvest_ready": sum(1 for s in summaries if s["harvest_ready"]),
+            "center": {
+                "lat": round(sum(s["gps_lat"] for s in summaries) / len(summaries), 4) if summaries else None,
+                "lng": round(sum(s["gps_long"] for s in summaries) / len(summaries), 4) if summaries else None,
+            },
+            "hives": summaries,
         })
-    return res
+    return result
+
 
 @app.get("/clusters/{cluster_id}", tags=["Apiaries"])
 def get_cluster(cluster_id: int, db: Session = Depends(database.get_db)):
-    c = db.query(models.Cluster).filter(models.Cluster.id == cluster_id).first()
-    if not c:
-        raise HTTPException(status_code=404, detail="Apiary cluster not found")
-    
-    hives = db.query(models.Hive).filter(models.Hive.cluster_id == c.id).all()
-    hive_list = []
-    for h in hives:
-        health_info = get_health(h.id, db)
-        hive_list.append({
-            "id": h.id,
-            "status": h.status,
-            "gps_lat": h.gps_lat,
-            "gps_long": h.gps_long,
-            "health_score": health_info["health_score"],
-            "health_status": health_info["status"]
-        })
-        
-    return {
-        "id": c.id,
-        "name": c.name,
-        "region": c.region,
-        "total_hives": len(hives),
-        "hives": hive_list
-    }
+    for c in list_clusters(db):
+        if c["id"] == cluster_id:
+            return c
+    raise HTTPException(status_code=404, detail="Apiary cluster not found")
+
 
 @app.get("/hives/", tags=["Hives"])
 def get_hives(db: Session = Depends(database.get_db)):
-    hives = db.query(models.Hive).all()
-    res = []
-    for h in hives:
-        latest_tel = db.query(models.Telemetry).filter(models.Telemetry.hive_id == h.id).order_by(models.Telemetry.timestamp.desc()).first()
-        res.append({
-            "id": h.id,
-            "owner_id": h.owner_id,
-            "cluster_id": h.cluster_id,
-            "gps_lat": h.gps_lat,
-            "gps_long": h.gps_long,
-            "status": h.status,
-            "installed_at": h.installed_at.isoformat() if h.installed_at else None,
-            "latest_temperature": latest_tel.temperature if latest_tel else 34.5,
-            "latest_humidity": latest_tel.humidity if latest_tel else 50.0,
-            "latest_weight": latest_tel.weight if latest_tel else 25.0
-        })
-    return res
+    return [hive_summary(db, h) for h in db.query(models.Hive).order_by(models.Hive.id).all()]
+
 
 @app.post("/hives/", tags=["Hives"])
 def create_hive(hive: HiveCreate, db: Session = Depends(database.get_db)):
-    db_hive = models.Hive(**hive.model_dump())
+    if not db.query(models.Cluster).filter(models.Cluster.id == hive.cluster_id).first():
+        raise HTTPException(status_code=404, detail="Apiary cluster not found")
+    db_hive = models.Hive(**hive.model_dump(), status="WATCH")
     db.add(db_hive)
     db.commit()
     db.refresh(db_hive)
     record_audit_log(db, action="Hive Registered", details=f"Registered Hive #{db_hive.id} at GPS ({db_hive.gps_lat}, {db_hive.gps_long})")
-    return db_hive
+    return hive_summary(db, db_hive)
 
-# --- Feature 1: Explainable Hive Health Score ---
+
+@app.get("/hives/{hive_id}", tags=["Hives"])
+def get_hive(hive_id: int, db: Session = Depends(database.get_db)):
+    hive = get_hive_or_404(db, hive_id)
+    summary = hive_summary(db, hive)
+    summary["beekeeper"] = hive.owner.name if hive.owner else None
+    return summary
+
+
 @app.get("/hives/{hive_id}/health", tags=["AI & Intelligence"])
 def get_health(hive_id: int, db: Session = Depends(database.get_db)):
-    records = db.query(models.Telemetry).filter(models.Telemetry.hive_id == hive_id).order_by(models.Telemetry.timestamp.desc()).limit(10).all()
-    
-    if not records:
-        return {
-            "hive_id": hive_id,
-            "health_score": 50,
-            "status": "WATCH",
-            "factors": {
-                "temperature": 50,
-                "humidity": 50,
-                "weight": 50,
-                "anomalies": 100,
-                "disease_risk": 100
-            },
-            "alerts": ["No telemetry data recorded yet"],
-            "recommendations": ["Check device connectivity"],
-            "score_explanation": "Insufficient telemetry records available to calculate precise health."
-        }
+    return compute_health(db, hive_id)
 
-    latest = records[0]
-    alerts_list = []
-    recs_list = []
-    explanations = []
 
-    # 1. Temperature score (Ideal: 34.5°C +/- 2.5°C)
-    temp_score = 100
-    temp_diff = abs(latest.temperature - 34.5)
-    if temp_diff > 1.0:
-        temp_score = max(0, int(100 - (temp_diff - 1.0) * 20))
-    if latest.temperature > 37.0:
-        alerts_list.append(f"High temperature ({latest.temperature}°C)")
-        recs_list.append("Inspect hive ventilation and verify sensor placement.")
-        explanations.append(f"Temperature high ({latest.temperature}°C)")
-    elif latest.temperature < 32.0:
-        alerts_list.append(f"Low temperature ({latest.temperature}°C)")
-        recs_list.append("Ensure hive insulation is intact.")
-        explanations.append(f"Temperature low ({latest.temperature}°C)")
-
-    # 2. Humidity score (Ideal: 45-65%)
-    hum_score = 100
-    if latest.humidity > 65.0:
-        hum_score = max(0, int(100 - (latest.humidity - 65.0) * 3))
-        alerts_list.append(f"High humidity ({latest.humidity}%)")
-        recs_list.append("Reduce moisture around hive base.")
-        explanations.append(f"Humidity elevated ({latest.humidity}%)")
-    elif latest.humidity < 40.0:
-        hum_score = max(0, int(100 - (40.0 - latest.humidity) * 3))
-
-    # 3. Weight score
-    weight_score = 90
-    if len(records) > 1:
-        weight_delta = latest.weight - records[-1].weight
-        if weight_delta < -1.0:
-            weight_score = 40
-            alerts_list.append(f"Sudden weight drop ({weight_delta:.1f} kg)")
-            recs_list.append("Check for potential colony swarming or robbery.")
-            explanations.append("Sudden weight drop observed")
-        elif weight_delta > 0.1:
-            weight_score = 98
-
-    # 4. Anomaly score
-    anomaly_cnt = db.query(models.Alert).filter(
-        models.Alert.hive_id == hive_id,
-        models.Alert.severity.in_(["WARNING", "CRITICAL"])
-    ).count()
-    anomaly_score = max(20, 100 - (anomaly_cnt * 15))
-    if anomaly_cnt > 0:
-        explanations.append(f"{anomaly_cnt} active alerts detected")
-
-    # 5. Disease Risk score from AI Vision
-    latest_ai = db.query(models.AIAnalysis).filter(models.AIAnalysis.hive_id == hive_id).order_by(models.AIAnalysis.timestamp.desc()).first()
-    disease_risk_score = 95
-    if latest_ai:
-        if latest_ai.varroa_count > 5:
-            disease_risk_score = max(10, 100 - (latest_ai.varroa_count * 7))
-            alerts_list.append(f"Varroa mite risk ({latest_ai.varroa_count} mites detected)")
-            recs_list.append("Perform manual colony inspection for Varroa infestation.")
-            explanations.append(f"High Varroa count ({latest_ai.varroa_count})")
-
-    # Overall weighted health score calculation
-    overall_health = int(
-        (temp_score * 0.30) +
-        (hum_score * 0.20) +
-        (weight_score * 0.20) +
-        (anomaly_score * 0.15) +
-        (disease_risk_score * 0.15)
-    )
-    overall_health = max(0, min(100, overall_health))
-
-    # Status determination
-    if overall_health >= 80:
-        status = "HEALTHY"
-    elif overall_health >= 65:
-        status = "WATCH"
-    elif overall_health >= 45:
-        status = "WARNING"
-    else:
-        status = "CRITICAL"
-
-    explanation_str = "Hive environmental parameters and colony status are optimal." if not explanations else f"Health score affected by: {', '.join(explanations)}."
-
-    return {
-        "hive_id": hive_id,
-        "health_score": overall_health,
-        "status": status,
-        "factors": {
-            "temperature": temp_score,
-            "humidity": hum_score,
-            "weight": weight_score,
-            "anomalies": anomaly_score,
-            "disease_risk": disease_risk_score
-        },
-        "alerts": alerts_list,
-        "recommendations": list(set(recs_list)),
-        "score_explanation": explanation_str
-    }
-
-# --- Feature 2: Honey Yield Prediction ---
 @app.get("/hives/{hive_id}/productivity", tags=["AI & Intelligence"])
 def get_productivity(hive_id: int, db: Session = Depends(database.get_db)):
-    records = db.query(models.Telemetry).filter(models.Telemetry.hive_id == hive_id).order_by(models.Telemetry.timestamp.desc()).limit(15).all()
-    
-    if not records:
-        return {
-            "hive_id": hive_id,
-            "current_weight_kg": 0.0,
-            "predicted_yield_kg": 0.0,
-            "confidence": 0.50,
-            "trend": "STABLE",
-            "harvest_window": "Insufficient Data",
-            "factors": ["No telemetry recorded yet"],
-            "label": "Estimated Yield (Prototype Model)"
-        }
+    return compute_productivity(db, hive_id)
 
-    current_weight = records[0].weight
-    avg_temp = sum(r.temperature for r in records) / len(records)
-    
-    # Weight trend over recent readings
-    if len(records) >= 2:
-        delta = records[0].weight - records[-1].weight
-        if delta > 0.5:
-            trend = "INCREASING"
-        elif delta < -0.5:
-            trend = "DECREASING"
-        else:
-            trend = "STABLE"
-    else:
-        trend = "STABLE"
 
-    # Harvest yield calculation
-    base_harvestable = max(0.0, current_weight - 18.0)
-    projected_final = base_harvestable * 1.15
-
-    # Penalties if overheating or severe anomalies
-    if not (32.0 <= avg_temp <= 36.5):
-        projected_final = max(0.0, projected_final - 1.5)
-
-    predicted_yield = round(projected_final, 1)
-
-    # Harvest window estimation
-    if current_weight >= 30.0:
-        harvest_window = "1-3 days (Harvest Ready)"
-    elif current_weight >= 26.0:
-        harvest_window = "3-5 days"
-    elif current_weight >= 22.0:
-        harvest_window = "1-2 weeks"
-    else:
-        harvest_window = "2-4 weeks"
-
-    factors = []
-    if trend == "INCREASING":
-        factors.append("Positive nectar weight accumulation")
-    elif trend == "DECREASING":
-        factors.append("Weight reduction observed in colony")
-    else:
-        factors.append("Stable weight baseline")
-
-    if 33.5 <= avg_temp <= 35.5:
-        factors.append("Optimal hive temperature for honey maturation")
-    else:
-        factors.append("Sub-optimal temperature impacting foraging activity")
-
-    return {
-        "hive_id": hive_id,
-        "current_weight_kg": round(current_weight, 1),
-        "predicted_yield_kg": predicted_yield,
-        "confidence": 0.84,
-        "trend": trend,
-        "harvest_window": harvest_window,
-        "factors": factors,
-        "label": "Estimated Yield (Prototype Model)"
-    }
-
-# --- Feature 8: Beekeeper Recommendation Engine ---
 @app.get("/hives/{hive_id}/recommendations", tags=["AI & Intelligence"])
 def get_recommendations(hive_id: int, db: Session = Depends(database.get_db)):
-    health_info = get_health(hive_id, db)
-    prod_info = get_productivity(hive_id, db)
-    
-    recs = []
-    if health_info["factors"]["temperature"] < 70:
-        recs.append({
-            "id": f"rec_{hive_id}_temp",
-            "priority": "HIGH",
-            "hive_id": hive_id,
-            "title": "Hive Temperature Management Required",
-            "explanation": "Temperature drift detected outside ideal 34.5°C range.",
-            "actions": [
-                "Inspect hive ventilation ports",
-                "Verify sensor calibration",
-                "Check direct solar exposure on hive box"
-            ],
-            "source": "IoT Telemetry + Rule Engine"
-        })
+    return compute_recommendations(db, hive_id)
 
-    if health_info["factors"]["disease_risk"] < 75:
-        recs.append({
-            "id": f"rec_{hive_id}_varroa",
-            "priority": "HIGH",
-            "hive_id": hive_id,
-            "title": "Varroa Mite Containment Inspection",
-            "explanation": "Vision AI model detected elevated Varroa mite count.",
-            "actions": [
-                "Perform sticky board count test",
-                "Apply organic oxalic acid treatment if confirmed",
-                "Isolate frame if infection spreads"
-            ],
-            "source": "YOLO Vision AI"
-        })
 
-    if prod_info["current_weight_kg"] >= 30.0:
-        recs.append({
-            "id": f"rec_{hive_id}_harvest",
-            "priority": "MEDIUM",
-            "hive_id": hive_id,
-            "title": "Harvest Window Reached",
-            "explanation": f"Hive weight reached {prod_info['current_weight_kg']} kg.",
-            "actions": [
-                "Inspect honey frame capping percentage (>80%)",
-                "Prepare extraction equipment",
-                "Create pre-mint batch provenance passport"
-            ],
-            "source": "Productivity Yield Model"
-        })
+@app.get("/telemetry/{hive_id}", tags=["IoT Telemetry"])
+@app.get("/hives/{hive_id}/telemetry", tags=["IoT Telemetry"])
+def get_hive_telemetry(hive_id: int, limit: int = 100, db: Session = Depends(database.get_db)):
+    limit = max(1, min(limit, 1000))
+    rows = (
+        db.query(models.Telemetry)
+        .filter(models.Telemetry.hive_id == hive_id)
+        .order_by(models.Telemetry.timestamp.desc())
+        .limit(limit)
+        .all()
+    )
+    return [serialize_telemetry(t) for t in rows]
 
-    if not recs:
-        recs.append({
-            "id": f"rec_{hive_id}_routine",
-            "priority": "LOW",
-            "hive_id": hive_id,
-            "title": "Routine Maintenance",
-            "explanation": "Hive is operating in healthy state.",
-            "actions": ["Maintain weekly telemetry monitoring"],
-            "source": "System Engine"
-        })
 
-    return recs
+@app.get("/hives/{hive_id}/analyses", tags=["AI & Intelligence"])
+def get_hive_analyses(hive_id: int, db: Session = Depends(database.get_db)):
+    rows = db.query(models.AIAnalysis).filter(models.AIAnalysis.hive_id == hive_id).order_by(models.AIAnalysis.timestamp.desc()).all()
+    return [serialize_analysis(a) for a in rows]
 
-# --- Feature 3: AI Insight Center ---
+
+@app.get("/hives/{hive_id}/batches", tags=["Blockchain & Traceability"])
+def get_hive_batches(hive_id: int, db: Session = Depends(database.get_db)):
+    rows = db.query(models.Batch).filter(models.Batch.hive_id == hive_id).order_by(models.Batch.created_at.desc()).all()
+    return [serialize_batch(db, b, include_origin=False) for b in rows]
+
+
+# --- AI insight center -------------------------------------------------------
 @app.get("/ai-insights", tags=["AI & Intelligence"])
 def get_ai_insights(db: Session = Depends(database.get_db)):
-    hives = db.query(models.Hive).all()
-    
-    hive_insights = []
-    disease_insights = []
-    productivity_insights = []
-    all_recommendations = []
-
-    for h in hives:
-        h_health = get_health(h.id, db)
-        h_prod = get_productivity(h.id, db)
-        h_recs = get_recommendations(h.id, db)
-        
+    hive_insights, disease, productivity, recommendations = [], [], [], []
+    for h in db.query(models.Hive).order_by(models.Hive.id).all():
+        health = compute_health(db, h.id)
+        prod = compute_productivity(db, h.id)
         hive_insights.append({
             "hive_id": h.id,
-            "health_score": h_health["health_score"],
-            "status": h_health["status"],
-            "score_explanation": h_health["score_explanation"]
+            "cluster_name": h.cluster.name if h.cluster else None,
+            "health_score": health["health_score"],
+            "status": health["status"],
+            "score_explanation": health["score_explanation"],
+            "factors": health["factors"],
         })
-
-        # Latest AI vision check
         latest_ai = db.query(models.AIAnalysis).filter(models.AIAnalysis.hive_id == h.id).order_by(models.AIAnalysis.timestamp.desc()).first()
         if latest_ai:
-            disease_insights.append({
+            disease.append({
                 "hive_id": h.id,
                 "varroa_count": latest_ai.varroa_count,
                 "infection_rate": round(latest_ai.infection_rate * 100, 1),
                 "healthy_bee_count": latest_ai.healthy_bee_count,
-                "confidence": 0.89,
-                "timestamp": latest_ai.timestamp.isoformat() if latest_ai.timestamp else None
+                "health_score": latest_ai.health_score,
+                "timestamp": iso(latest_ai.timestamp),
             })
-
-        productivity_insights.append({
+        productivity.append({
             "hive_id": h.id,
-            "current_weight_kg": h_prod["current_weight_kg"],
-            "predicted_yield_kg": h_prod["predicted_yield_kg"],
-            "trend": h_prod["trend"],
-            "harvest_window": h_prod["harvest_window"]
+            "current_weight_kg": prod["current_weight_kg"],
+            "predicted_yield_kg": prod["predicted_yield_kg"],
+            "trend": prod["trend"],
+            "harvest_ready": prod["harvest_ready"],
+            "harvest_window": prod["harvest_window"],
         })
+        recommendations += [r for r in compute_recommendations(db, h.id, health, prod) if r["priority"] in ("HIGH", "MEDIUM")]
 
-        for r in h_recs:
-            if r["priority"] in ["HIGH", "MEDIUM"]:
-                all_recommendations.append(r)
-
+    recommendations.sort(key=lambda r: 0 if r["priority"] == "HIGH" else 1)
+    disease.sort(key=lambda d: -d["varroa_count"])
     return {
-        "hive_intelligence": hive_insights,
-        "disease_intelligence": disease_insights,
-        "productivity_intelligence": productivity_insights,
-        "recommendations": all_recommendations
+        "hive_intelligence": sorted(hive_insights, key=lambda h: h["health_score"]),
+        "disease_intelligence": disease,
+        "productivity_intelligence": sorted(productivity, key=lambda p: -p["current_weight_kg"]),
+        "recommendations": recommendations,
     }
 
-# --- Feature 4: Alert Center ---
-@app.get("/alerts", response_model=List[AlertResponse], tags=["Alerts"])
+
+# --- Alerts ------------------------------------------------------------------
+@app.get("/alerts", tags=["Alerts"])
 def get_alerts(
     hive_id: Optional[int] = None,
     severity: Optional[str] = None,
     type: Optional[str] = None,
     status: Optional[str] = None,
-    db: Session = Depends(database.get_db)
+    limit: int = 100,
+    db: Session = Depends(database.get_db),
 ):
     query = db.query(models.Alert)
     if hive_id:
         query = query.filter(models.Alert.hive_id == hive_id)
     if severity:
-        query = query.filter(models.Alert.severity == severity)
+        query = query.filter(models.Alert.severity == severity.upper())
     if type:
-        query = query.filter(models.Alert.type == type)
+        query = query.filter(models.Alert.type == type.upper())
     if status == "acknowledged":
-        query = query.filter(models.Alert.acknowledged == True)
+        query = query.filter(models.Alert.acknowledged == True, models.Alert.resolved == False)  # noqa: E712
     elif status == "unacknowledged":
-        query = query.filter(models.Alert.acknowledged == False)
+        query = query.filter(models.Alert.acknowledged == False)  # noqa: E712
     elif status == "resolved":
-        query = query.filter(models.Alert.resolved == True)
-    elif status == "unresolved":
-        query = query.filter(models.Alert.resolved == False)
+        query = query.filter(models.Alert.resolved == True)  # noqa: E712
+    elif status in ("unresolved", "open"):
+        query = query.filter(models.Alert.resolved == False)  # noqa: E712
+    rows = query.order_by(models.Alert.timestamp.desc()).limit(max(1, min(limit, 500))).all()
+    return [serialize_alert(a) for a in rows]
 
-    return query.order_by(models.Alert.timestamp.desc()).limit(100).all()
 
-@app.post("/alerts/{alert_id}/acknowledge", response_model=AlertResponse, tags=["Alerts"])
+def _update_alert(db: Session, alert_id: int, resolve: bool) -> dict:
+    alert = db.query(models.Alert).filter(models.Alert.id == alert_id).first()
+    if not alert:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    alert.acknowledged = True
+    if resolve:
+        alert.resolved = True
+    db.commit()
+    db.refresh(alert)
+    refresh_hive_status(db, alert.hive_id)
+    record_audit_log(db, action="Alert Resolved" if resolve else "Alert Acknowledged",
+                     details=f"{'Resolved' if resolve else 'Acknowledged'} alert #{alert_id} on Hive #{alert.hive_id}")
+    return serialize_alert(alert)
+
+
+@app.post("/alerts/{alert_id}/acknowledge", tags=["Alerts"])
 def acknowledge_alert(alert_id: int, db: Session = Depends(database.get_db)):
-    alert = db.query(models.Alert).filter(models.Alert.id == alert_id).first()
-    if not alert:
-        raise HTTPException(status_code=404, detail="Alert not found")
-    alert.acknowledged = True
-    db.commit()
-    db.refresh(alert)
-    record_audit_log(db, action="Alert Acknowledged", details=f"Acknowledged alert #{alert_id} on Hive #{alert.hive_id}")
-    return alert
+    return _update_alert(db, alert_id, resolve=False)
 
-@app.post("/alerts/{alert_id}/resolve", response_model=AlertResponse, tags=["Alerts"])
+
+@app.post("/alerts/{alert_id}/resolve", tags=["Alerts"])
 def resolve_alert(alert_id: int, db: Session = Depends(database.get_db)):
-    alert = db.query(models.Alert).filter(models.Alert.id == alert_id).first()
-    if not alert:
-        raise HTTPException(status_code=404, detail="Alert not found")
-    alert.resolved = True
-    alert.acknowledged = True
-    db.commit()
-    db.refresh(alert)
-    record_audit_log(db, action="Alert Resolved", details=f"Resolved alert #{alert_id} on Hive #{alert.hive_id}")
-    return alert
+    return _update_alert(db, alert_id, resolve=True)
 
-# --- Telemetry Ingestion ---
+
+# --- Telemetry ingestion -----------------------------------------------------
 @app.post("/telemetry/", tags=["IoT Telemetry"])
 @app.post("/telemetry", tags=["IoT Telemetry"])
 def create_telemetry(telemetry: TelemetryCreate, db: Session = Depends(database.get_db)):
-    last_reading = db.query(models.Telemetry).filter(models.Telemetry.hive_id == telemetry.hive_id)\
-                     .order_by(models.Telemetry.timestamp.desc()).first()
-    
-    weight_delta = 0.0
-    if last_reading:
-        weight_delta = telemetry.weight - last_reading.weight
+    get_hive_or_404(db, telemetry.hive_id)
+    last_reading = latest_telemetry(db, telemetry.hive_id)
+    weight_delta = telemetry.weight - last_reading.weight if last_reading else 0.0
 
-    db_telemetry = models.Telemetry(**telemetry.model_dump())
+    db_telemetry = models.Telemetry(**telemetry.model_dump(), timestamp=datetime.utcnow())
     db.add(db_telemetry)
     db.commit()
     db.refresh(db_telemetry)
-    
-    harvest_ready = telemetry.weight > 30.0 and weight_delta > 0
-    
+
+    crossed_harvest = telemetry.weight >= HARVEST_WEIGHT_KG and (last_reading is None or last_reading.weight < HARVEST_WEIGHT_KG)
+    harvest_ready = telemetry.weight > HARVEST_WEIGHT_KG and weight_delta > 0
+
+    def alert(type_, severity, reason, message, source, value):
+        return models.Alert(hive_id=telemetry.hive_id, type=type_, severity=severity, reason=reason,
+                            message=message, source=source, current_value=value, timestamp=datetime.utcnow())
+
     alerts = []
     if telemetry.temperature > 37.0:
-        alerts.append(models.Alert(
-            hive_id=telemetry.hive_id,
-            type="TEMPERATURE",
-            severity="CRITICAL",
-            reason="Hive temperature overheating",
-            message=f"Temperature reached {telemetry.temperature}°C",
-            source="IoT Telemetry",
-            current_value=telemetry.temperature
-        ))
+        alerts.append(alert("TEMPERATURE", "CRITICAL", "Hive temperature overheating", f"Temperature reached {telemetry.temperature}°C", "IoT Telemetry", telemetry.temperature))
     elif telemetry.temperature < 32.0:
-        alerts.append(models.Alert(
-            hive_id=telemetry.hive_id,
-            type="TEMPERATURE",
-            severity="WARNING",
-            reason="Hive temperature below ideal",
-            message=f"Temperature dropped to {telemetry.temperature}°C",
-            source="IoT Telemetry",
-            current_value=telemetry.temperature
-        ))
-        
+        alerts.append(alert("TEMPERATURE", "WARNING", "Hive temperature below ideal", f"Temperature dropped to {telemetry.temperature}°C", "IoT Telemetry", telemetry.temperature))
     if telemetry.humidity > 65.0:
-        alerts.append(models.Alert(
-            hive_id=telemetry.hive_id,
-            type="HUMIDITY",
-            severity="WARNING",
-            reason="Excess moisture detected",
-            message=f"Humidity reached {telemetry.humidity}%",
-            source="IoT Telemetry",
-            current_value=telemetry.humidity
-        ))
-        
+        alerts.append(alert("HUMIDITY", "WARNING", "Excess moisture detected", f"Humidity reached {telemetry.humidity}%", "IoT Telemetry", telemetry.humidity))
     if weight_delta < -1.0:
-        alerts.append(models.Alert(
-            hive_id=telemetry.hive_id,
-            type="WEIGHT",
-            severity="CRITICAL",
-            reason="Rapid weight drop (swarming or robbery)",
-            message=f"Weight dropped by {weight_delta:.1f}kg",
-            source="IoT Telemetry",
-            current_value=telemetry.weight
-        ))
-        
-    if harvest_ready:
-        alerts.append(models.Alert(
-            hive_id=telemetry.hive_id,
-            type="HARVEST_READY",
-            severity="SUCCESS",
-            reason="Hive crossed harvest threshold",
-            message=f"Hive weight reached {telemetry.weight}kg",
-            source="RuleEngine",
-            current_value=telemetry.weight
-        ))
-        
-    # IsolationForest ML check
-    if anomaly_detector is not None:
-        try:
-            is_anomaly = anomaly_detector.predict([telemetry.temperature, telemetry.humidity, telemetry.weight])
-            if is_anomaly and not alerts:
-                alerts.append(models.Alert(
-                    hive_id=telemetry.hive_id,
-                    type="ANOMALY",
-                    severity="WARNING",
-                    reason="IsolationForest ML anomaly detected",
-                    message="Multivariate environmental drift",
-                    source="Anomaly Engine",
-                    current_value=telemetry.temperature
-                ))
-        except Exception:
-            pass
+        alerts.append(alert("WEIGHT", "CRITICAL", "Rapid weight drop (swarming or robbing)", f"Weight dropped by {abs(weight_delta):.1f} kg", "IoT Telemetry", telemetry.weight))
+    if crossed_harvest:
+        alerts.append(alert("HARVEST_READY", "SUCCESS", "Hive crossed harvest threshold", f"Hive weight reached {telemetry.weight} kg", "Rule Engine", telemetry.weight))
+    if not alerts and anomaly_detector.predict([telemetry.temperature, telemetry.humidity, telemetry.weight]):
+        alerts.append(alert("ANOMALY", "WARNING", "Multivariate sensor anomaly detected", "IsolationForest flagged environmental drift", "Anomaly Engine", telemetry.temperature))
 
-    for alert in alerts:
-        db.add(alert)
-        db.add(models.Notification(message=f"Hive {telemetry.hive_id}: {alert.reason}"))
-        
+    for a in alerts:
+        db.add(a)
+        db.add(models.Notification(message=f"Hive #{telemetry.hive_id}: {a.reason}", timestamp=datetime.utcnow()))
     if alerts:
         db.commit()
 
-    record_audit_log(db, action="Telemetry Ingested", actor=f"Sensor Node #{telemetry.hive_id}", details=f"Temp: {telemetry.temperature}°C, Hum: {telemetry.humidity}%, Weight: {telemetry.weight}kg")
+    status = refresh_hive_status(db, telemetry.hive_id)
+    record_audit_log(db, action="Telemetry Ingested", actor=f"Sensor Node #{telemetry.hive_id}",
+                     details=f"Temp {telemetry.temperature}°C, humidity {telemetry.humidity}%, weight {telemetry.weight} kg")
 
     payload = {
-        "telemetry": {
-            "id": db_telemetry.id,
-            "hive_id": db_telemetry.hive_id,
-            "temperature": db_telemetry.temperature,
-            "humidity": db_telemetry.humidity,
-            "weight": db_telemetry.weight,
-            "timestamp": db_telemetry.timestamp.isoformat() if db_telemetry.timestamp else None
-        }, 
+        "telemetry": serialize_telemetry(db_telemetry),
         "weight_delta": round(weight_delta, 2),
         "harvest_ready": harvest_ready,
-        "alerts_generated": len(alerts)
+        "alerts_generated": len(alerts),
+        "hive_status": status,
     }
-
-    # Broadcast over WebSockets
-    try:
-        import asyncio
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            loop.create_task(ws_manager.broadcast(f"hive_{telemetry.hive_id}", payload))
-            if alerts:
-                loop.create_task(ws_manager.broadcast("alerts", {"hive_id": telemetry.hive_id, "alerts_count": len(alerts)}))
-    except Exception:
-        pass
-
+    ws_manager.publish(f"hive_{telemetry.hive_id}", payload)
+    if alerts:
+        ws_manager.publish("alerts", {"hive_id": telemetry.hive_id, "alerts_count": len(alerts)})
     return payload
+
+
+SCENARIOS = {
+    "NORMAL": (34.5, 50.0, None),
+    "HIGH_TEMPERATURE": (38.5, 50.0, None),
+    "LOW_TEMPERATURE": (30.5, 50.0, None),
+    "HIGH_HUMIDITY": (34.5, 72.0, None),
+    "WEIGHT_INCREASE": (34.5, 50.0, "+"),
+    "WEIGHT_DROP": (34.5, 50.0, "-"),
+    "ABNORMAL_HIVE": (39.0, 78.0, "-"),
+}
+
 
 @app.post("/simulate-scenario", tags=["IoT Telemetry"])
 def simulate_scenario(req: ScenarioSimulateRequest, db: Session = Depends(database.get_db)):
-    import random
-    temp_base = 34.5
-    hum_base = 50.0
-    weight_base = 25.0
-    
-    if req.scenario == "HIGH_TEMPERATURE":
-        temp_base = 38.5
-    elif req.scenario == "HIGH_HUMIDITY":
-        hum_base = 72.0
-    elif req.scenario == "WEIGHT_INCREASE":
-        weight_base = 32.5
-    elif req.scenario == "WEIGHT_DROP":
-        weight_base = 14.5
-    elif req.scenario == "ABNORMAL_HIVE":
-        temp_base = 39.0
-        hum_base = 78.0
-        weight_base = 12.0
+    scenario = req.scenario.upper()
+    if scenario not in SCENARIOS:
+        raise HTTPException(status_code=400, detail=f"Unknown scenario. Choose one of: {', '.join(SCENARIOS)}")
+    get_hive_or_404(db, req.hive_id)
+    temp, hum, weight_mode = SCENARIOS[scenario]
+    last = latest_telemetry(db, req.hive_id)
+    current_weight = last.weight if last else 25.0
+    if weight_mode == "+":
+        weight = max(current_weight + 1.5, HARVEST_WEIGHT_KG + 1.5)
+    elif weight_mode == "-":
+        weight = max(5.0, current_weight - 3.0)
+    else:
+        weight = current_weight + random.uniform(0.0, 0.2)
 
-    telemetry_data = TelemetryCreate(
+    return create_telemetry(TelemetryCreate(
         hive_id=req.hive_id,
-        temperature=round(random.uniform(temp_base - 0.5, temp_base + 0.5), 1),
-        humidity=round(random.uniform(hum_base - 2.0, hum_base + 2.0), 1),
-        weight=round(random.uniform(weight_base - 0.2, weight_base + 0.2), 1)
-    )
-    return create_telemetry(telemetry_data, db)
+        temperature=round(random.uniform(temp - 0.3, temp + 0.3), 1),
+        humidity=round(random.uniform(hum - 1.5, hum + 1.5), 1),
+        weight=round(weight, 1),
+    ), db)
 
-# --- AI Vision Inspection ---
-MAX_FILE_SIZE = 5 * 1024 * 1024 # 5 MB
 
+# --- AI vision inspection ------------------------------------------------------
 @app.post("/analyze-frame/", tags=["AI & Intelligence"])
 async def analyze_hive_frame(
     file: UploadFile = File(...),
     hive_id: int = Form(...),
-    db: Session = Depends(database.get_db)
+    scenario: Optional[str] = Form(None),
+    db: Session = Depends(database.get_db),
 ):
-    if not file.filename.lower().endswith(('.jpg', '.jpeg', '.png')):
+    if not (file.filename or "").lower().endswith((".jpg", ".jpeg", ".png")):
         raise HTTPException(status_code=400, detail="Invalid file type. Only JPEG/PNG allowed.")
-    
-    image_bytes = await file.read()
+    get_hive_or_404(db, hive_id)
+
+    image_bytes = await file.read(MAX_FILE_SIZE + 1)
     if len(image_bytes) > MAX_FILE_SIZE:
         raise HTTPException(status_code=400, detail="File too large. Maximum size is 5MB.")
-    
-    results = vision_model.analyze_image(image_bytes)
-    
+    try:
+        results = vision_model.analyze_image(image_bytes, scenario=scenario)
+    except InvalidImageError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
     analysis = models.AIAnalysis(
         hive_id=hive_id,
         health_score=results["health_score"],
-        infection_rate=results.get("infection_rate_percentage", 0) / 100.0,
-        varroa_count=results.get("mite_count", 0),
-        healthy_bee_count=results.get("bee_count", 0),
-        image_ref=file.filename
+        infection_rate=results["infection_rate_percentage"] / 100.0,
+        varroa_count=results["mite_count"],
+        healthy_bee_count=results["bee_count"],
+        image_ref=file.filename,
+        timestamp=datetime.utcnow(),
     )
     db.add(analysis)
-    
-    if results["health_score"] < 70:
-        alert = models.Alert(
-            hive_id=hive_id,
-            type="VARROA",
-            severity="WARNING",
-            reason="Low colony health score detected on frame",
-            message=f"Vision model reported {results.get('mite_count', 0)} Varroa mites",
-            source="AI Vision",
-            current_value=results["health_score"]
-        )
-        db.add(alert)
-        db.add(models.Notification(message=f"Hive {hive_id}: Low health score ({results['health_score']}) detected."))
-        
-    db.commit()
-    record_audit_log(db, action="AI Frame Inspection", actor="YOLO Vision Model", details=f"Analyzed frame for Hive #{hive_id}. Varroa: {results.get('mite_count', 0)}, Score: {results['health_score']}")
-    
-    return {
-        "filename": file.filename,
-        "results": results,
-        "model_status": "prototype_inference",
-        "analysis_id": analysis.id
-    }
 
-# --- Blockchain Batch Operations ---
+    if results["health_score"] < 70:
+        severity = "CRITICAL" if results["health_score"] < 45 else "WARNING"
+        db.add(models.Alert(
+            hive_id=hive_id, type="VARROA", severity=severity,
+            reason="Varroa infestation detected on inspected frame",
+            message=f"{results['mite_count']} mites detected, frame health {results['health_score']}",
+            source="AI Vision", current_value=results["health_score"], timestamp=datetime.utcnow(),
+        ))
+        db.add(models.Notification(message=f"Hive #{hive_id}: Varroa risk — frame health {results['health_score']}", timestamp=datetime.utcnow()))
+
+    db.commit()
+    db.refresh(analysis)
+    refresh_hive_status(db, hive_id)
+    record_audit_log(db, action="AI Frame Inspection", actor="Vision Model",
+                     details=f"Analyzed frame for Hive #{hive_id}. Varroa: {results['mite_count']}, score: {results['health_score']}")
+
+    return {"filename": file.filename, "results": results, "model_status": "prototype_inference", "analysis_id": analysis.id}
+
+
+# --- Batches & blockchain ------------------------------------------------------
 @app.post("/mint-batch/", tags=["Blockchain & Traceability"])
 def mint_batch(batch: BatchCreate, db: Session = Depends(database.get_db)):
+    get_hive_or_404(db, batch.hive_id)
+    floral = batch.floral_source.strip()
+    now = datetime.utcnow()
     batch_uuid = f"HC-{uuid.uuid4().hex[:8].upper()}"
-    batch_count = db.query(models.Batch).count()
-    token_id = str(1000 + batch_count + 1)
 
-    metadata = {
-        "hive_id": batch.hive_id,
-        "floral_source": batch.floral_source,
-        "weight_kg": batch.weight,
-        "ai_health_score": batch.health_score,
-        "timestamp": datetime.utcnow().isoformat()
-    }
-    ipfs_uri = IPFSService.pin_json(metadata)
-    
-    canonical_string = f"{batch.hive_id}_{batch.floral_source}_{batch.weight}_{batch.health_score}"
-    tx_hash = BlockchainService.mint_token(canonical_string, ipfs_uri, batch.floral_source)
+    ipfs_uri = IPFSService.pin_json({
+        "hive_id": batch.hive_id, "floral_source": floral, "weight_kg": batch.weight,
+        "ai_health_score": batch.health_score, "timestamp": now.isoformat(),
+    })
+    canonical = batch_canonical_string(batch.hive_id, floral, batch.weight, batch.health_score)
+    minted = BlockchainService.mint_token(canonical, ipfs_uri, floral)
+
+    token_id = minted.token_id
+    if token_id is None:
+        max_token = db.query(func.max(models.Batch.token_id)).scalar()
+        token_id = str(int(max_token) + 1 if max_token and str(max_token).isdigit() else 1001)
 
     db_batch = models.Batch(
-        batch_id=batch_uuid,
-        hive_id=batch.hive_id,
-        token_id=token_id,
-        ipfs_cid=ipfs_uri,
-        tx_hash=tx_hash,
-        health_score=batch.health_score,
-        floral_source=batch.floral_source,
-        weight_kg=batch.weight,
-        blockchain_mode=BLOCKCHAIN_MODE
+        batch_id=batch_uuid, hive_id=batch.hive_id, token_id=token_id, ipfs_cid=ipfs_uri,
+        tx_hash=minted.tx_hash, data_hash=canonical_hash(canonical), health_score=batch.health_score,
+        floral_source=floral, weight_kg=batch.weight, blockchain_mode=minted.mode, created_at=now, updated_at=now,
     )
     db.add(db_batch)
     db.commit()
     db.refresh(db_batch)
 
-    record_audit_log(db, action="Batch Minted", actor="Beekeeper", details=f"Minted Batch #{batch_uuid} ({batch.weight}kg {batch.floral_source})", blockchain_tx=tx_hash)
+    record_audit_log(db, action="Batch Minted", actor="Beekeeper",
+                     details=f"Minted batch {batch_uuid} ({batch.weight} kg {floral}) from Hive #{batch.hive_id}",
+                     blockchain_tx=minted.tx_hash)
+    db.add(models.Notification(message=f"Batch {batch_uuid} minted from Hive #{batch.hive_id}", timestamp=now))
+    db.commit()
 
-    qr_base64 = utils.generate_qr_code(batch_id=batch_uuid)
-    verification_url = f"https://honeychain.app/consumer/batch/{batch_uuid}"
+    data = serialize_batch(db, db_batch)
+    data["weight_kg"] = batch.weight
+    data["qr_code"] = utils.generate_qr_code(batch_uuid)
+    return data
 
-    return {
-        "batch_id": batch_uuid,
-        "hive_id": batch.hive_id,
-        "token_id": token_id,
-        "ipfs_cid": ipfs_uri,
-        "tx_hash": tx_hash,
-        "blockchain_mode": BLOCKCHAIN_MODE,
-        "health_score": batch.health_score,
-        "floral_source": batch.floral_source,
-        "weight_kg": batch.weight,
-        "verification_url": verification_url,
-        "qr_code": qr_base64
-    }
 
 @app.get("/batches/", tags=["Blockchain & Traceability"])
 def list_batches(db: Session = Depends(database.get_db)):
-    return db.query(models.Batch).order_by(models.Batch.created_at.desc()).all()
+    return [serialize_batch(db, b) for b in db.query(models.Batch).order_by(models.Batch.created_at.desc()).all()]
+
 
 @app.get("/batches/{batch_id}", tags=["Blockchain & Traceability"])
 def get_batch(batch_id: str, db: Session = Depends(database.get_db)):
-    db_batch = db.query(models.Batch).filter(models.Batch.batch_id == batch_id).first()
-    if not db_batch:
-        raise HTTPException(status_code=404, detail="Batch Not Found")
-    return db_batch
+    return serialize_batch(db, get_batch_or_404(db, batch_id))
+
+
+@app.get("/batches/{batch_id}/qr", tags=["Blockchain & Traceability"])
+def get_batch_qr(batch_id: str, db: Session = Depends(database.get_db)):
+    b = get_batch_or_404(db, batch_id)
+    return {"batch_id": b.batch_id, "verification_url": utils.verification_url(b.batch_id), "qr_code": utils.generate_qr_code(b.batch_id)}
+
+
+@app.get("/batches/{batch_id}/timeline", tags=["Blockchain & Traceability"])
+def get_batch_timeline(batch_id: str, db: Session = Depends(database.get_db)):
+    """Provenance events for the consumer passport, built from real records."""
+    b = get_batch_or_404(db, batch_id)
+    hive = db.query(models.Hive).filter(models.Hive.id == b.hive_id).first()
+    events = []
+    if hive:
+        events.append({"key": "registered", "title": "Hive registered", "timestamp": iso(hive.installed_at),
+                       "detail": f"Hive #{hive.id} registered{' at ' + hive.cluster.name if hive.cluster else ''} with GPS-tagged IoT sensors."})
+    tel_count = db.query(models.Telemetry).filter(models.Telemetry.hive_id == b.hive_id, models.Telemetry.timestamp <= b.created_at).count()
+    first_tel = db.query(models.Telemetry).filter(models.Telemetry.hive_id == b.hive_id).order_by(models.Telemetry.timestamp.asc()).first()
+    if tel_count:
+        events.append({"key": "monitoring", "title": "Continuous IoT monitoring", "timestamp": iso(first_tel.timestamp) if first_tel else None,
+                       "detail": f"{tel_count} temperature, humidity and weight readings recorded before harvest."})
+    inspection = (
+        db.query(models.AIAnalysis)
+        .filter(models.AIAnalysis.hive_id == b.hive_id, models.AIAnalysis.timestamp <= b.created_at + timedelta(days=1))
+        .order_by(models.AIAnalysis.timestamp.desc())
+        .first()
+    )
+    if inspection:
+        events.append({"key": "inspection", "title": "AI frame inspection", "timestamp": iso(inspection.timestamp),
+                       "detail": f"{inspection.varroa_count} Varroa mites detected; frame health {inspection.health_score}/100."})
+    events.append({"key": "harvest", "title": "Harvest & batch creation", "timestamp": iso(b.created_at),
+                   "detail": f"{b.weight_kg} kg of {b.floral_source} extracted. Colony health score {b.health_score}/100."})
+    events.append({"key": "anchored", "title": "Provenance anchored" + (" on Sepolia" if b.blockchain_mode == "sepolia" else " (demo ledger)"),
+                   "timestamp": iso(b.created_at), "detail": f"Token #{b.token_id} minted; metadata pinned at {b.ipfs_cid}."})
+    if b.is_revoked:
+        events.append({"key": "revoked", "title": "Revoked by KVIC", "timestamp": iso(b.updated_at), "detail": b.revocation_reason or "Batch revoked."})
+    return events
+
 
 @app.post("/batches/{batch_id}/revoke", tags=["Blockchain & Traceability"])
 def revoke_batch(batch_id: str, req: RevokeRequest, db: Session = Depends(database.get_db)):
-    db_batch = db.query(models.Batch).filter(models.Batch.batch_id == batch_id).first()
-    if not db_batch:
-        raise HTTPException(status_code=404, detail="Batch Not Found")
-    
-    db_batch.is_revoked = True
-    db_batch.revocation_reason = req.reason
+    b = get_batch_or_404(db, batch_id)
+    if b.is_revoked:
+        raise HTTPException(status_code=409, detail="Batch is already revoked")
+    b.is_revoked = True
+    b.revocation_reason = req.reason.strip()
+    b.updated_at = datetime.utcnow()
     db.commit()
-    db.refresh(db_batch)
-    
-    record_audit_log(db, action="Batch Revoked", actor="KVIC Admin", details=f"Revoked Batch #{batch_id}. Reason: {req.reason}")
-    record_security_event(db, event_type="BATCH_REVOKED", severity="HIGH", description=f"Batch {batch_id} revoked by KVIC Admin: {req.reason}")
-    
-    return db_batch
+    db.refresh(b)
+
+    chain_tx = BlockchainService.revoke_token(b.token_id, b.revocation_reason) if b.blockchain_mode == "sepolia" else None
+    record_audit_log(db, action="Batch Revoked", actor="KVIC Admin", details=f"Revoked batch {batch_id}. Reason: {b.revocation_reason}", blockchain_tx=chain_tx)
+    record_security_event(db, event_type="BATCH_REVOKED", severity="HIGH", description=f"Batch {batch_id} revoked: {b.revocation_reason}", actor="KVIC Admin")
+    db.add(models.Notification(message=f"Batch {batch_id} revoked by KVIC", timestamp=datetime.utcnow()))
+    db.commit()
+    return serialize_batch(db, b)
+
 
 @app.post("/batches/{batch_id}/tamper", tags=["Blockchain & Traceability"])
 def tamper_batch(batch_id: str, req: TamperBatchRequest, db: Session = Depends(database.get_db)):
-    db_batch = db.query(models.Batch).filter(models.Batch.batch_id == batch_id).first()
-    if not db_batch:
-        raise HTTPException(status_code=404, detail="Batch Not Found")
-    db_batch.tampered_health_score = req.tampered_score
+    b = get_batch_or_404(db, batch_id)
+    b.tampered_health_score = req.tampered_score
     db.commit()
-    db.refresh(db_batch)
-    
-    record_audit_log(db, action="Tamper Simulation", actor="Demo System", details=f"Simulated tamper on Batch #{batch_id} to score {req.tampered_score}")
-    record_security_event(db, event_type="TAMPER_SIMULATION", severity="MEDIUM", description=f"Simulated modification of Batch {batch_id} health score")
-    
-    return {"message": "Batch tampered successfully for demo", "tampered_score": req.tampered_score}
+    record_audit_log(db, action="Tamper Simulation", actor="Demo System", details=f"Simulated tamper on batch {batch_id}: score set to {req.tampered_score}")
+    record_security_event(db, event_type="TAMPER_SIMULATION", severity="MEDIUM", description=f"Simulated modification of batch {batch_id} health score", actor="Demo System")
+    return {"message": "Batch record modified (demo tamper)", "tampered_score": req.tampered_score}
+
 
 @app.post("/batches/{batch_id}/restore", tags=["Blockchain & Traceability"])
 def restore_batch(batch_id: str, db: Session = Depends(database.get_db)):
-    db_batch = db.query(models.Batch).filter(models.Batch.batch_id == batch_id).first()
-    if not db_batch:
-        raise HTTPException(status_code=404, detail="Batch Not Found")
-    db_batch.tampered_health_score = None
+    b = get_batch_or_404(db, batch_id)
+    b.tampered_health_score = None
     db.commit()
-    db.refresh(db_batch)
-    
-    record_audit_log(db, action="Integrity Restored", actor="Demo System", details=f"Restored integrity for Batch #{batch_id}")
+    record_audit_log(db, action="Integrity Restored", actor="Demo System", details=f"Restored original record for batch {batch_id}")
     return {"message": "Batch integrity restored"}
 
+
 @app.post("/batches/{batch_id}/verify-integrity", tags=["Blockchain & Traceability"])
-def verify_integrity(batch_id: str, db: Session = Depends(database.get_db)):
-    db_batch = db.query(models.Batch).filter(models.Batch.batch_id == batch_id).first()
-    if not db_batch:
-        raise HTTPException(status_code=404, detail="Batch Not Found")
-        
-    score_for_verification = db_batch.tampered_health_score if db_batch.tampered_health_score is not None else db_batch.health_score
-    floral = db_batch.floral_source or "Wildflower"
-    weight = db_batch.weight_kg if db_batch.weight_kg is not None else 32.5
-    
-    canonical_string = f"{db_batch.hive_id}_{floral}_{weight}_{score_for_verification}"
-    current_hash = "0x" + hashlib.sha256(canonical_string.encode()).hexdigest()
-    
-    is_verified = (current_hash == db_batch.tx_hash) and (db_batch.tampered_health_score is None) and (not db_batch.is_revoked)
-    
-    record_audit_log(db, action="Integrity Verified", actor="Consumer", details=f"Verified Batch #{batch_id} authenticity: {is_verified}")
-    
-    status_str = "Authentic" if is_verified else ("REVOKED" if db_batch.is_revoked else "Integrity Mismatch Detected")
+def verify_integrity(batch_id: str, actor: str = "Consumer", db: Session = Depends(database.get_db)):
+    result = integrity_of(get_batch_or_404(db, batch_id))
+    actor = actor.strip()[:40] or "Consumer"
+    record_audit_log(db, action="Integrity Verified", actor=actor, details=f"Verified batch {batch_id} authenticity: {result['verified']}")
+    return result
 
-    return {
-        "verified": is_verified,
-        "current_hash": current_hash,
-        "anchored_hash": db_batch.tx_hash,
-        "is_tampered": db_batch.tampered_health_score is not None,
-        "is_revoked": db_batch.is_revoked,
-        "revocation_reason": db_batch.revocation_reason,
-        "status": status_str
-    }
 
-# --- Feature 11: Audit Log ---
+# --- Audit, security, analytics ------------------------------------------------
 @app.get("/audit-logs", tags=["Audit & Security"])
-def list_audit_logs(db: Session = Depends(database.get_db)):
-    logs = db.query(models.AuditLog).order_by(models.AuditLog.timestamp.desc()).limit(100).all()
-    return [{
-        "id": l.id,
-        "action": l.action,
-        "actor": l.actor,
-        "details": l.details,
-        "blockchain_tx": l.blockchain_tx,
-        "timestamp": l.timestamp.isoformat() if l.timestamp else None
-    } for l in logs]
+def list_audit_logs(limit: int = 200, action: Optional[str] = None, db: Session = Depends(database.get_db)):
+    query = db.query(models.AuditLog)
+    if action:
+        query = query.filter(models.AuditLog.action == action)
+    rows = query.order_by(models.AuditLog.timestamp.desc()).limit(max(1, min(limit, 1000))).all()
+    return [{"id": l.id, "action": l.action, "actor": l.actor, "details": l.details, "blockchain_tx": l.blockchain_tx, "timestamp": iso(l.timestamp)} for l in rows]
 
-# --- Feature 16: Security Dashboard ---
+
 @app.get("/admin/security", tags=["Audit & Security"])
 def security_dashboard(db: Session = Depends(database.get_db)):
     batches = db.query(models.Batch).all()
-    tamper_cnt = sum(1 for b in batches if b.tampered_health_score is not None)
-    revoked_cnt = sum(1 for b in batches if b.is_revoked)
-    sec_events = db.query(models.SecurityEvent).order_by(models.SecurityEvent.timestamp.desc()).limit(20).all()
+    integrity = [integrity_of(b) for b in batches]
+    mismatched = sum(1 for i in integrity if i["is_tampered"])
+    revoked = sum(1 for b in batches if b.is_revoked)
+    since = datetime.utcnow() - timedelta(hours=24)
+    failed_verifications = db.query(models.AuditLog).filter(
+        models.AuditLog.action == "Integrity Verified", models.AuditLog.actor == "Consumer",
+        models.AuditLog.details.like("%: False")).count()
+    suspicious = db.query(models.SecurityEvent).filter(
+        models.SecurityEvent.severity.in_(["HIGH", "CRITICAL"]), models.SecurityEvent.timestamp >= since).count()
+    events = db.query(models.SecurityEvent).order_by(models.SecurityEvent.timestamp.desc()).limit(50).all()
 
     return {
         "security_status": {
-            "database_integrity": "OK",
-            "blockchain_verification": "ACTIVE",
+            "database_integrity": "OK" if mismatched == 0 else "MISMATCH",
+            "blockchain_verification": "ACTIVE" if BLOCKCHAIN_MODE == "sepolia" else "DEMO",
             "qr_integrity": "OK",
-            "revoked_batches": revoked_cnt,
-            "tamper_events": tamper_cnt,
-            "failed_verification": tamper_cnt + revoked_cnt,
-            "suspicious_activity": 0
+            "batches_checked": len(batches),
+            "integrity_mismatches": mismatched,
+            "revoked_batches": revoked,
+            "tamper_events": db.query(models.SecurityEvent).filter(models.SecurityEvent.event_type == "TAMPER_SIMULATION").count(),
+            "failed_verification": failed_verifications,
+            "suspicious_activity": suspicious,
         },
-        "events": [{
-            "id": e.id,
-            "event_type": e.event_type,
-            "severity": e.severity,
-            "description": e.description,
-            "actor": e.actor,
-            "timestamp": e.timestamp.isoformat() if e.timestamp else None
-        } for e in sec_events]
+        "batches": [{"batch_id": b.batch_id, "floral_source": b.floral_source, **i} for b, i in zip(batches, integrity)],
+        "events": [{"id": e.id, "event_type": e.event_type, "severity": e.severity, "description": e.description,
+                    "actor": e.actor, "timestamp": iso(e.timestamp)} for e in events],
     }
 
-# --- Feature 26: Analytics Dashboard ---
+
 @app.get("/admin/analytics", tags=["Admin & Analytics"])
 def analytics_dashboard(db: Session = Depends(database.get_db)):
     hives = db.query(models.Hive).all()
     total_hives = len(hives)
-    
     batches = db.query(models.Batch).all()
-    total_batches = len(batches)
-    revoked_batches = sum(1 for b in batches if b.is_revoked)
-    verified_batches = sum(1 for b in batches if not b.is_revoked and b.tampered_health_score is None)
+    now = datetime.utcnow()
 
-    total_weight_produced = sum(b.weight_kg for b in batches if b.weight_kg)
-    avg_yield_per_hive = round(total_weight_produced / max(1, total_hives), 1)
+    total_kg = sum(b.weight_kg or 0 for b in batches)
+    last_30 = sum(b.weight_kg or 0 for b in batches if b.created_at and b.created_at >= now - timedelta(days=30))
+    prev_30 = sum(b.weight_kg or 0 for b in batches if b.created_at and now - timedelta(days=60) <= b.created_at < now - timedelta(days=30))
+    trend = f"{'+' if last_30 >= prev_30 else ''}{round((last_30 - prev_30) / prev_30 * 100, 1)}% vs previous 30 days" if prev_30 else "No prior-period data"
 
-    # Health percentages
-    healthy_cnt = 0
-    watch_cnt = 0
-    warning_cnt = 0
-    critical_cnt = 0
+    by_source = defaultdict(lambda: {"weight_kg": 0.0, "batches": 0})
+    for b in batches:
+        by_source[b.floral_source or "Unknown"]["weight_kg"] += b.weight_kg or 0
+        by_source[b.floral_source or "Unknown"]["batches"] += 1
 
+    status_counts = defaultdict(int)
+    harvest_ready, offline = 0, 0
     for h in hives:
-        h_health = get_health(h.id, db)
-        st = h_health["status"]
-        if st == "HEALTHY": healthy_cnt += 1
-        elif st == "WATCH": watch_cnt += 1
-        elif st == "WARNING": warning_cnt += 1
-        else: critical_cnt += 1
+        status_counts[compute_health(db, h.id)["status"]] += 1
+        tel = latest_telemetry(db, h.id)
+        if tel and tel.weight >= HARVEST_WEIGHT_KG:
+            harvest_ready += 1
+        if not tel or now - tel.timestamp >= OFFLINE_AFTER:
+            offline += 1
 
-    healthy_pct = round((healthy_cnt / max(1, total_hives)) * 100, 1)
-    watch_pct = round((watch_cnt / max(1, total_hives)) * 100, 1)
-    warning_pct = round((warning_cnt / max(1, total_hives)) * 100, 1)
-    critical_pct = round((critical_cnt / max(1, total_hives)) * 100, 1)
+    def pct(n):
+        return round(n / max(1, total_hives) * 100, 1)
 
-    # Disease & IoT metrics
-    ai_records = db.query(models.AIAnalysis).all()
-    varroa_detections = sum(a.varroa_count for a in ai_records)
-    
-    telemetry_cnt = db.query(models.Telemetry).count()
-    alerts_cnt = db.query(models.Alert).count()
+    latest_ai = {}
+    for a in db.query(models.AIAnalysis).order_by(models.AIAnalysis.timestamp.asc()).all():
+        latest_ai[a.hive_id] = a
+    all_ai = db.query(models.AIAnalysis).all()
+
+    verifications = db.query(models.AuditLog).filter(models.AuditLog.action == "Integrity Verified", models.AuditLog.actor == "Consumer")
+    verification_count = verifications.count()
+    failed = verifications.filter(models.AuditLog.details.like("%: False")).count()
 
     return {
         "production": {
-            "total_honey_produced_kg": round(total_weight_produced, 1),
-            "avg_yield_per_hive_kg": avg_yield_per_hive,
-            "harvest_ready_hives": sum(1 for h in hives if get_productivity(h.id, db)["current_weight_kg"] >= 30.0),
-            "production_trend": "+12.4% vs last cycle"
+            "total_honey_produced_kg": round(total_kg, 1),
+            "avg_yield_per_hive_kg": round(total_kg / max(1, total_hives), 1),
+            "harvest_ready_hives": harvest_ready,
+            "production_trend": trend,
+            "by_floral_source": sorted(
+                [{"floral_source": k, "weight_kg": round(v["weight_kg"], 1), "batches": v["batches"]} for k, v in by_source.items()],
+                key=lambda x: -x["weight_kg"],
+            ),
         },
         "hive_health": {
-            "healthy_pct": healthy_pct,
-            "watch_pct": watch_pct,
-            "warning_pct": warning_pct,
-            "critical_pct": critical_pct
+            "healthy": status_counts["HEALTHY"], "watch": status_counts["WATCH"],
+            "warning": status_counts["WARNING"], "critical": status_counts["CRITICAL"],
+            "healthy_pct": pct(status_counts["HEALTHY"]), "watch_pct": pct(status_counts["WATCH"]),
+            "warning_pct": pct(status_counts["WARNING"]), "critical_pct": pct(status_counts["CRITICAL"]),
         },
         "disease": {
-            "total_varroa_detections": varroa_detections,
-            "disease_risk_hives": sum(1 for a in ai_records if a.varroa_count > 5),
-            "disease_trend": "Contained"
+            "total_varroa_detections": sum(a.varroa_count for a in all_ai),
+            "inspections": len(all_ai),
+            "disease_risk_hives": sum(1 for a in latest_ai.values() if a.varroa_count > 5),
+            "disease_trend": "Contained" if sum(1 for a in latest_ai.values() if a.varroa_count > 5) <= max(1, total_hives // 10) else "Spreading",
         },
         "iot": {
-            "active_devices": total_hives,
-            "offline_devices": 0,
-            "telemetry_points_ingested": telemetry_cnt,
-            "anomalies_detected": alerts_cnt
+            "active_devices": total_hives - offline,
+            "offline_devices": offline,
+            "telemetry_points_ingested": db.query(models.Telemetry).count(),
+            "anomalies_detected": db.query(models.Alert).filter(models.Alert.severity.in_(["WARNING", "CRITICAL"])).count(),
+            "open_alerts": db.query(models.Alert).filter(models.Alert.resolved == False).count(),  # noqa: E712
         },
         "blockchain": {
-            "batches_minted": total_batches,
-            "verified_batches": verified_batches,
-            "revoked_batches": revoked_batches
+            "batches_minted": len(batches),
+            "verified_batches": sum(1 for b in batches if integrity_of(b)["verified"]),
+            "revoked_batches": sum(1 for b in batches if b.is_revoked),
         },
         "consumer": {
-            "qr_scans": total_batches * 14,
-            "verification_attempts": total_batches * 12,
-            "failed_verifications": revoked_batches
-        }
+            "verification_attempts": verification_count,
+            "failed_verifications": failed,
+            "success_rate_pct": round((verification_count - failed) / verification_count * 100, 1) if verification_count else None,
+        },
     }
 
-# --- Feature 27: Export & Reporting ---
+
+EXPORTS = {
+    "telemetry": (["id", "hive_id", "temperature", "humidity", "weight", "timestamp"],
+                  lambda db: db.query(models.Telemetry).order_by(models.Telemetry.timestamp.desc()).limit(5000).all(),
+                  lambda r: [r.id, r.hive_id, r.temperature, r.humidity, r.weight, iso(r.timestamp)]),
+    "batches": (["batch_id", "hive_id", "token_id", "floral_source", "weight_kg", "health_score", "is_revoked", "revocation_reason", "blockchain_mode", "tx_hash", "ipfs_cid", "created_at"],
+                lambda db: db.query(models.Batch).order_by(models.Batch.created_at.desc()).all(),
+                lambda b: [b.batch_id, b.hive_id, b.token_id, b.floral_source, b.weight_kg, b.health_score, b.is_revoked, b.revocation_reason, b.blockchain_mode, b.tx_hash, b.ipfs_cid, iso(b.created_at)]),
+    "alerts": (["id", "hive_id", "type", "severity", "reason", "source", "acknowledged", "resolved", "timestamp"],
+               lambda db: db.query(models.Alert).order_by(models.Alert.timestamp.desc()).all(),
+               lambda a: [a.id, a.hive_id, a.type, a.severity, a.reason, a.source, a.acknowledged, a.resolved, iso(a.timestamp)]),
+    "audit-logs": (["id", "action", "actor", "details", "blockchain_tx", "timestamp"],
+                   lambda db: db.query(models.AuditLog).order_by(models.AuditLog.timestamp.desc()).all(),
+                   lambda l: [l.id, l.action, l.actor, l.details, l.blockchain_tx, iso(l.timestamp)]),
+}
+
+
 @app.get("/export/csv/{data_type}", tags=["Admin & Analytics"])
 def export_csv(data_type: str, db: Session = Depends(database.get_db)):
+    if data_type not in EXPORTS:
+        raise HTTPException(status_code=400, detail=f"Invalid export type. Choose one of: {', '.join(EXPORTS)}")
+    header, fetch, row = EXPORTS[data_type]
     output = io.StringIO()
     writer = csv.writer(output)
-
-    if data_type == "telemetry":
-        writer.writerow(["id", "hive_id", "temperature", "humidity", "weight", "timestamp"])
-        for r in db.query(models.Telemetry).limit(500).all():
-            writer.writerow([r.id, r.hive_id, r.temperature, r.humidity, r.weight, r.timestamp])
-    elif data_type == "batches":
-        writer.writerow(["batch_id", "hive_id", "token_id", "floral_source", "weight_kg", "health_score", "is_revoked", "tx_hash", "created_at"])
-        for b in db.query(models.Batch).all():
-            writer.writerow([b.batch_id, b.hive_id, b.token_id, b.floral_source, b.weight_kg, b.health_score, b.is_revoked, b.tx_hash, b.created_at])
-    elif data_type == "alerts":
-        writer.writerow(["id", "hive_id", "type", "severity", "reason", "source", "acknowledged", "resolved", "timestamp"])
-        for a in db.query(models.Alert).all():
-            writer.writerow([a.id, a.hive_id, a.type, a.severity, a.reason, a.source, a.acknowledged, a.resolved, a.timestamp])
-    elif data_type == "audit-logs":
-        writer.writerow(["id", "action", "actor", "details", "blockchain_tx", "timestamp"])
-        for l in db.query(models.AuditLog).all():
-            writer.writerow([l.id, l.action, l.actor, l.details, l.blockchain_tx, l.timestamp])
-    else:
-        raise HTTPException(status_code=400, detail="Invalid export type")
-
-    output.seek(0)
+    writer.writerow(header)
+    for r in fetch(db):
+        writer.writerow(row(r))
     return StreamingResponse(
         iter([output.getvalue()]),
         media_type="text/csv",
-        headers={"Content-Disposition": f"attachment; filename=honeychain_{data_type}.csv"}
+        headers={"Content-Disposition": f"attachment; filename=honeychain_{data_type}_{datetime.utcnow():%Y%m%d}.csv"},
     )
 
+
 @app.get("/export/pdf/apiary/{cluster_id}", tags=["Admin & Analytics"])
-def export_apiary_pdf(cluster_id: int, db: Session = Depends(database.get_db)):
+@app.get("/export/report/apiary/{cluster_id}", tags=["Admin & Analytics"])
+def export_apiary_report(cluster_id: int, db: Session = Depends(database.get_db)):
     c = db.query(models.Cluster).filter(models.Cluster.id == cluster_id).first()
     if not c:
         raise HTTPException(status_code=404, detail="Cluster not found")
-    
-    hives = db.query(models.Hive).filter(models.Hive.cluster_id == c.id).all()
-    
-    report_text = f"""====================================================
-           HONEY CHAIN OFFICIAL APIARY REPORT
-====================================================
-Generated Timestamp: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}
-Apiary Name: {c.name}
-Region: {c.region}
-Total Managed Hives: {len(hives)}
 
-----------------------------------------------------
-HIVE HEALTH BREAKDOWN
-----------------------------------------------------
-"""
-    for h in hives:
-        h_health = get_health(h.id, db)
-        report_text += f"Hive #{h.id} | Status: {h_health['status']} | Health Score: {h_health['health_score']}/100\n"
-        report_text += f"  - Score Explanation: {h_health['score_explanation']}\n\n"
+    rule = "=" * 64
+    sub = "-" * 64
+    lines = [
+        rule, "               HONEY CHAIN OFFICIAL APIARY REPORT", rule,
+        f"Generated:     {datetime.utcnow():%Y-%m-%d %H:%M:%S} UTC",
+        f"Apiary:        {c.name}",
+        f"Region:        {c.region}",
+        f"Managed hives: {len(c.hives)}",
+        "", sub, "HIVE HEALTH BREAKDOWN", sub,
+    ]
+    for h in sorted(c.hives, key=lambda h: h.id):
+        health = compute_health(db, h.id)
+        tel = latest_telemetry(db, h.id)
+        reading = f"{tel.temperature}°C / {tel.humidity}% / {tel.weight} kg" if tel else "no telemetry"
+        lines.append(f"Hive #{h.id:<3} {health['status']:<9} score {health['health_score']:>3}/100   latest: {reading}")
+        lines.append(f"          {health['score_explanation']}")
+    hive_ids = [h.id for h in c.hives]
+    batches = db.query(models.Batch).filter(models.Batch.hive_id.in_(hive_ids)).order_by(models.Batch.created_at.desc()).all() if hive_ids else []
+    lines += ["", sub, "HONEY BATCHES", sub]
+    if not batches:
+        lines.append("No batches minted from this apiary yet.")
+    for b in batches:
+        state = "REVOKED" if b.is_revoked else ("VERIFIED" if integrity_of(b)["verified"] else "MISMATCH")
+        lines.append(f"{b.batch_id:<16} Hive #{b.hive_id:<3} {b.weight_kg:>6} kg  {b.floral_source:<28} {state}")
+    anchor = "Sepolia ERC-721 with SHA-256 integrity proofs" if BLOCKCHAIN_MODE == "sepolia" else "the demo ledger (SHA-256 integrity proofs; Sepolia minting disabled)"
+    lines += ["", sub, "PROVENANCE", sub, f"Batches from this apiary are anchored on {anchor}.", rule, ""]
 
-    report_text += """----------------------------------------------------
-BLOCKCHAIN & QUALITY AUDIT STATUS
-----------------------------------------------------
-All honey batches harvested from this apiary are anchored on
-Sepolia ERC-721 with cryptographic SHA-256 integrity proofs
-and IPFS decentralized metadata preservation.
-
-Certified by: KVIC National Honey Board
-====================================================
-"""
     return Response(
-        content=report_text,
-        media_type="text/plain",
-        headers={"Content-Disposition": f"attachment; filename=apiary_report_cluster_{cluster_id}.txt"}
+        content="\n".join(lines),
+        media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition": f"attachment; filename=apiary_report_cluster_{cluster_id}.txt"},
     )
 
-# --- Feature 17: Enhanced HoneyBot ---
+
+# --- HoneyBot ------------------------------------------------------------------
 @app.post("/honeybot/query", tags=["AI & Intelligence"])
 def honeybot_query(req: HoneyBotRequest, db: Session = Depends(database.get_db)):
     q = req.query.lower()
-    hives = db.query(models.Hive).all()
-    
-    if "unhealthy" in q or "critical" in q or "risk" in q:
-        unhealthy = []
+    hives = db.query(models.Hive).order_by(models.Hive.id).all()
+    default_chips = ["Unhealthy hives", "Harvest ready", "Varroa risk", "Today's alerts", "Batch verification"]
+
+    def reply(text_, chips=None):
+        return {"query": req.query, "reply": text_, "chips": chips or default_chips}
+
+    if any(k in q for k in ("unhealthy", "critical", "risk", "attention", "sick")) and "varroa" not in q:
+        rows = []
         for h in hives:
-            info = get_health(h.id, db)
-            if info["status"] in ["WARNING", "CRITICAL", "WATCH"]:
-                unhealthy.append(f"Hive #{h.id} ({info['status']}, Score: {info['health_score']}) - {info['score_explanation']}")
-        
-        reply = "Here are the hives requiring attention:\n" + ("\n".join(unhealthy) if unhealthy else "All hives are currently HEALTHY!")
-        return {"query": req.query, "reply": reply, "chips": ["Harvest Ready", "Today's Alerts", "Varroa Risk"]}
+            info = compute_health(db, h.id)
+            if info["status"] != "HEALTHY":
+                rows.append((info["health_score"], f"• Hive #{h.id} — {info['status']} ({info['health_score']}/100): {info['score_explanation']}"))
+        rows.sort()
+        return reply("Hives needing attention:\n" + "\n".join(r for _, r in rows) if rows else "All hives are currently healthy.")
 
-    if "varroa" in q or "disease" in q or "mite" in q:
-        ai_records = db.query(models.AIAnalysis).order_by(models.AIAnalysis.timestamp.desc()).all()
-        infected = [f"Hive #{a.hive_id}: {a.varroa_count} Varroa mites counted (Health Score: {a.health_score})" for a in ai_records if a.varroa_count > 3]
-        reply = "Varroa infection report:\n" + ("\n".join(infected) if infected else "No significant Varroa infestation detected across frames!")
-        return {"query": req.query, "reply": reply, "chips": ["Unhealthy Hives", "Today's Alerts", "Batch Verification"]}
+    if any(k in q for k in ("varroa", "disease", "mite")):
+        latest = {}
+        for a in db.query(models.AIAnalysis).order_by(models.AIAnalysis.timestamp.asc()).all():
+            latest[a.hive_id] = a
+        infected = [f"• Hive #{a.hive_id}: {a.varroa_count} mites, frame health {a.health_score}/100" for a in sorted(latest.values(), key=lambda a: -a.varroa_count) if a.varroa_count > 3]
+        return reply("Varroa report (latest inspection per hive):\n" + "\n".join(infected) if infected else "No significant Varroa infestation in the latest inspections.")
 
-    if "harvest" in q or "ready" in q or "yield" in q:
+    if any(k in q for k in ("harvest", "ready", "yield")):
         ready = []
         for h in hives:
-            prod = get_productivity(h.id, db)
-            if prod["current_weight_kg"] >= 28.0:
-                ready.append(f"Hive #{h.id}: Current weight {prod['current_weight_kg']}kg, Estimated yield {prod['predicted_yield_kg']}kg (Window: {prod['harvest_window']})")
-        reply = "Harvest readiness status:\n" + ("\n".join(ready) if ready else "No hives have reached full harvest weight yet.")
-        return {"query": req.query, "reply": reply, "chips": ["Unhealthy Hives", "Varroa Risk", "Today's Alerts"]}
+            prod = compute_productivity(db, h.id)
+            if prod["current_weight_kg"] >= HARVEST_WEIGHT_KG - 2:
+                ready.append(f"• Hive #{h.id}: {prod['current_weight_kg']} kg, est. yield {prod['predicted_yield_kg']} kg ({prod['harvest_window']})")
+        return reply("Harvest readiness:\n" + "\n".join(ready) if ready else "No hives are near harvest weight yet.")
 
-    if "alert" in q or "anomaly" in q or "today" in q:
-        alerts = db.query(models.Alert).order_by(models.Alert.timestamp.desc()).limit(5).all()
-        alert_str = [f"[{a.severity}] Hive #{a.hive_id}: {a.reason}" for a in alerts]
-        reply = "Recent system alerts:\n" + ("\n".join(alert_str) if alert_str else "No recent alerts recorded.")
-        return {"query": req.query, "reply": reply, "chips": ["Unhealthy Hives", "Harvest Ready", "Varroa Risk"]}
+    if any(k in q for k in ("alert", "anomaly", "today")):
+        alerts = db.query(models.Alert).filter(models.Alert.resolved == False).order_by(models.Alert.timestamp.desc()).limit(6).all()  # noqa: E712
+        return reply("Open alerts:\n" + "\n".join(f"• [{a.severity}] Hive #{a.hive_id}: {a.reason}" for a in alerts) if alerts else "There are no open alerts.")
 
-    if "batch" in q or "authentic" in q or "verify" in q:
-        batches = db.query(models.Batch).order_by(models.Batch.created_at.desc()).limit(3).all()
-        b_str = [f"Batch {b.batch_id} (Hive #{b.hive_id}): {'REVOKED' if b.is_revoked else 'VERIFIED'} - Token #{b.token_id}" for b in batches]
-        reply = "Recent Honey Batches provenance status:\n" + "\n".join(b_str)
-        return {"query": req.query, "reply": reply, "chips": ["Unhealthy Hives", "Harvest Ready", "Today's Alerts"]}
+    if any(k in q for k in ("batch", "authentic", "verify", "revoke")):
+        batches = db.query(models.Batch).order_by(models.Batch.created_at.desc()).limit(5).all()
+        lines = [f"• {b.batch_id} ({b.floral_source}, Hive #{b.hive_id}): {'REVOKED' if b.is_revoked else ('VERIFIED' if integrity_of(b)['verified'] else 'INTEGRITY MISMATCH')}" for b in batches]
+        return reply("Recent batches:\n" + "\n".join(lines) if lines else "No batches have been minted yet.")
 
-    return {
-        "query": req.query,
-        "reply": f"HoneyBot analyzed system data for '{req.query}': Currently monitoring {len(hives)} hives across 3 apiary clusters. Systems operating with active Sepolia blockchain provenance anchoring.",
-        "chips": ["Unhealthy Hives", "Harvest Ready", "Varroa Risk", "Today's Alerts", "Batch Verification"]
-    }
+    ids = [int(t.lstrip("#")) for t in q.replace("hive", " ").split() if t.lstrip("#").isdigit()]
+    if ids:
+        hive = db.query(models.Hive).filter(models.Hive.id == ids[0]).first()
+        if hive:
+            info = compute_health(db, hive.id)
+            prod = compute_productivity(db, hive.id)
+            return reply(
+                f"Hive #{hive.id} ({hive.cluster.name if hive.cluster else 'unassigned'}): {info['status']}, score {info['health_score']}/100. "
+                f"{info['score_explanation']} Weight {prod['current_weight_kg']} kg, trend {prod['trend'].lower()}, harvest window {prod['harvest_window']}."
+            )
 
-# --- Feature 15: Real-Time WebSockets ---
+    clusters = db.query(models.Cluster).count()
+    mode = "Sepolia" if BLOCKCHAIN_MODE == "sepolia" else "demo-ledger"
+    return reply(
+        f"I'm monitoring {len(hives)} hives across {clusters} apiaries with {mode} provenance anchoring. "
+        "Ask about unhealthy hives, Varroa risk, harvest readiness, open alerts, batch verification, or a specific hive (e.g. \"hive 4\")."
+    )
+
+
+# --- WebSockets ------------------------------------------------------------------
 @app.websocket("/ws/hives/{hive_id}")
 async def websocket_hive(websocket: WebSocket, hive_id: int):
-    await ws_manager.connect(f"hive_{hive_id}", websocket)
+    topic = f"hive_{hive_id}"
+    await ws_manager.connect(topic, websocket)
     try:
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
-        ws_manager.disconnect(f"hive_{hive_id}", websocket)
+        ws_manager.disconnect(topic, websocket)
+
 
 @app.websocket("/ws/alerts")
 async def websocket_alerts(websocket: WebSocket):
@@ -1260,47 +1157,3 @@ async def websocket_alerts(websocket: WebSocket):
             await websocket.receive_text()
     except WebSocketDisconnect:
         ws_manager.disconnect("alerts", websocket)
-
-# --- General System Utilities ---
-@app.get("/telemetry/{hive_id}", tags=["IoT Telemetry"])
-@app.get("/hives/{hive_id}/telemetry", tags=["IoT Telemetry"])
-def get_hive_telemetry(hive_id: int, db: Session = Depends(database.get_db), limit: int = 100):
-    return db.query(models.Telemetry).filter(models.Telemetry.hive_id == hive_id).order_by(models.Telemetry.timestamp.desc()).limit(limit).all()
-
-@app.get("/hives/{hive_id}/analyses", response_model=List[AIAnalysisResponse], tags=["AI & Intelligence"])
-def get_hive_analyses(hive_id: int, db: Session = Depends(database.get_db)):
-    return db.query(models.AIAnalysis).filter(models.AIAnalysis.hive_id == hive_id).order_by(models.AIAnalysis.timestamp.desc()).all()
-
-@app.get("/notifications", response_model=List[NotificationResponse], tags=["System"])
-def get_notifications(db: Session = Depends(database.get_db)):
-    return db.query(models.Notification).order_by(models.Notification.timestamp.desc()).limit(50).all()
-
-@app.get("/stats/kpis", tags=["System"])
-def get_kpis(db: Session = Depends(database.get_db)):
-    hives_count = db.query(models.Hive).count()
-    batches_count = db.query(models.Batch).count()
-    alerts_count = db.query(models.Alert).count()
-    return {
-        "total_hives": hives_count,
-        "total_batches": batches_count,
-        "alerts": alerts_count
-    }
-
-@app.get("/search", tags=["System"])
-def search(q: str, db: Session = Depends(database.get_db)):
-    hives = db.query(models.Hive).filter(models.Hive.id == int(q) if q.isdigit() else False).all()
-    batches = db.query(models.Batch).filter(models.Batch.batch_id.ilike(f"%{q}%")).all()
-    return {
-        "hives": [{"id": h.id, "status": h.status} for h in hives],
-        "batches": [{"id": b.id, "batch_id": b.batch_id} for b in batches]
-    }
-
-@app.post("/system/reset-demo", tags=["System"])
-def reset_demo_system():
-    try:
-        from seed_demo import reset_db, seed_data
-        reset_db()
-        seed_data()
-        return {"status": "success", "message": "Database successfully reset and seeded for demo!"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))

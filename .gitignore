@@ -44,3 +44,8 @@ frontend/.next/
 # Hardhat & Solc
 blockchain/artifacts/
 blockchain/cache/
+
+# Test / tooling caches
+.pytest_cache/
+frontend/next-env.d.ts
+frontend/tsconfig.tsbuildinfo
