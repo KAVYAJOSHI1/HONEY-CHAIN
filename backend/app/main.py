@@ -1243,3 +1243,35 @@ async def websocket_alerts(websocket: WebSocket):
             await websocket.receive_text()
     except WebSocketDisconnect:
         ws_manager.disconnect("alerts", websocket)
+
+
+@app.websocket("/ws")
+async def websocket_generic(websocket: WebSocket):
+    await ws_manager.connect("alerts", websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        ws_manager.disconnect("alerts", websocket)
+
+
+@app.get("/api/system/status", tags=["System"])
+@app.get("/api/video/status", tags=["System"])
+@app.get("/api/voice/status", tags=["System"])
+def api_status_alias():
+    return {"status": "ONLINE", "mode": BLOCKCHAIN_MODE}
+
+
+@app.get("/api/demo/videos", tags=["System"])
+def api_demo_videos():
+    return [{"id": "1", "title": "Hive Inspection Sample", "url": "/sample.mp4"}]
+
+
+@app.get("/api/procedures/{proc_id}", tags=["System"])
+def api_procedure(proc_id: str):
+    return {
+        "id": proc_id,
+        "title": "Standard Operating Procedure",
+        "status": "APPROVED",
+        "steps": ["Inspect ventilation", "Verify temperature sensors", "Scan frames with YOLO AI"]
+    }
