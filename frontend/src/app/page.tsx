@@ -78,13 +78,14 @@ export default function Home() {
         </div>
 
         {/* System Architecture Tech Badge Bar */}
-        <div className="pt-8 flex flex-wrap justify-center items-center gap-3 text-xs text-slate-400 font-mono">
-          <span className="px-3 py-1 bg-slate-900 border border-slate-800 rounded-lg">FastAPI</span>
-          <span className="px-3 py-1 bg-slate-900 border border-slate-800 rounded-lg">Next.js 14</span>
-          <span className="px-3 py-1 bg-slate-900 border border-slate-800 rounded-lg">Solidity ERC-721</span>
-          <span className="px-3 py-1 bg-slate-900 border border-slate-800 rounded-lg">IsolationForest ML</span>
-          <span className="px-3 py-1 bg-slate-900 border border-slate-800 rounded-lg">YOLO Varroa Detector</span>
-          <span className="px-3 py-1 bg-slate-900 border border-slate-800 rounded-lg">IPFS Pinning</span>
+        <div className="pt-6 flex flex-wrap justify-center items-center gap-3 text-xs text-slate-400 font-mono">
+          <Link href="/ai-insights" className="px-3.5 py-1.5 bg-slate-900/90 hover:bg-slate-800 text-amber-300 border border-amber-500/30 rounded-lg transition-colors">🧠 AI Insights</Link>
+          <Link href="/alerts" className="px-3.5 py-1.5 bg-slate-900/90 hover:bg-slate-800 text-amber-300 border border-amber-500/30 rounded-lg transition-colors">🔔 Alert Center</Link>
+          <Link href="/beekeeper/apiary" className="px-3.5 py-1.5 bg-slate-900/90 hover:bg-slate-800 text-amber-300 border border-amber-500/30 rounded-lg transition-colors">🐝 Apiary View</Link>
+          <Link href="/admin/analytics" className="px-3.5 py-1.5 bg-slate-900/90 hover:bg-slate-800 text-amber-300 border border-amber-500/30 rounded-lg transition-colors">📊 Analytics</Link>
+          <Link href="/admin/security" className="px-3.5 py-1.5 bg-slate-900/90 hover:bg-slate-800 text-amber-300 border border-amber-500/30 rounded-lg transition-colors">🛡️ Security</Link>
+          <Link href="/admin/audit-logs" className="px-3.5 py-1.5 bg-slate-900/90 hover:bg-slate-800 text-amber-300 border border-amber-500/30 rounded-lg transition-colors">📜 Audit Trail</Link>
+          <Link href="/system-health" className="px-3.5 py-1.5 bg-slate-900/90 hover:bg-slate-800 text-amber-300 border border-amber-500/30 rounded-lg transition-colors">⚡ Health 2.0</Link>
         </div>
       </main>
     </div>
