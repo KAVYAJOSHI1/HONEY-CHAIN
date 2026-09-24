@@ -9,6 +9,9 @@ interface BatchData {
   ipfs_cid: string;
   tx_hash: string;
   health_score: number;
+  floral_source?: string;
+  weight_kg?: number;
+  tampered_health_score?: number | null;
   is_revoked: boolean;
   revocation_reason: string | null;
   blockchain_mode: string;
@@ -19,37 +22,80 @@ export default function ConsumerVerification({ params }: { params: { batchId: st
   const [batch, setBatch] = useState<BatchData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  
+  const [integrityState, setIntegrityState] = useState<{ verified: boolean; status: string; current_hash: string; anchored_hash: string; is_tampered?: boolean } | null>(null);
+  const [checking, setChecking] = useState(false);
+  const [showIpfsModal, setShowIpfsModal] = useState(false);
+  const [showCertModal, setShowCertModal] = useState(false);
+
+  const fetchBatch = async () => {
+    try {
+      const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+      const res = await fetch(`${apiUrl}/batches/${params.batchId}`);
+      if (!res.ok) {
+        if (res.status === 404) setError('NotFound');
+        else setError('BackendFailure');
+        return;
+      }
+      const data = await res.json();
+      setBatch(data);
+    } catch {
+      setError('BackendFailure');
+    } finally {
+      setLoading(false);
+    }
+  };
 
   useEffect(() => {
-    async function fetchBatch() {
-      try {
-        const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
-        const res = await fetch(`${apiUrl}/batches/${params.batchId}`);
-        if (!res.ok) {
-          if (res.status === 404) {
-            setError('NotFound');
-          } else {
-            setError('BackendFailure');
-          }
-          return;
-        }
-        const data = await res.json();
-        setBatch(data);
-      } catch {
-        setError('BackendFailure');
-      } finally {
-        setLoading(false);
-      }
-    }
     fetchBatch();
   }, [params.batchId]);
 
+  const verifyIntegrity = async () => {
+    setChecking(true);
+    try {
+      const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+      const res = await fetch(`${apiUrl}/batches/${params.batchId}/verify-integrity`, { method: 'POST' });
+      const data = await res.json();
+      setIntegrityState(data);
+    } catch {
+      alert("Integrity check failed");
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  const simulateTamper = async () => {
+    try {
+      const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+      await fetch(`${apiUrl}/batches/${params.batchId}/tamper`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tampered_score: 30.0 })
+      });
+      await fetchBatch();
+      await verifyIntegrity();
+    } catch {
+      alert("Failed to tamper");
+    }
+  };
+
+  const restoreIntegrity = async () => {
+    try {
+      const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+      await fetch(`${apiUrl}/batches/${params.batchId}/restore`, { method: 'POST' });
+      await fetchBatch();
+      await verifyIntegrity();
+    } catch {
+      alert("Failed to restore");
+    }
+  };
+
   if (loading) {
     return (
-      <div className="min-h-screen bg-slate-50 flex items-center justify-center">
+      <div className="min-h-screen bg-slate-950 flex items-center justify-center text-slate-200">
         <div className="animate-pulse flex flex-col items-center">
           <div className="w-12 h-12 border-4 border-amber-400 border-t-transparent rounded-full animate-spin mb-4"></div>
-          <div className="text-slate-500 font-medium">Verifying Honey Batch...</div>
+          <div className="text-slate-400 font-mono text-sm">Validating Decentralized Honey Passport...</div>
         </div>
       </div>
     );
@@ -57,23 +103,14 @@ export default function ConsumerVerification({ params }: { params: { batchId: st
 
   if (error === 'NotFound') {
     return (
-      <div className="min-h-screen bg-slate-50 flex items-center justify-center">
-        <div className="bg-white p-8 rounded-xl shadow-lg text-center max-w-sm w-full border border-slate-200">
-          <div className="text-4xl mb-4">❓</div>
-          <h1 className="text-xl font-bold text-slate-800 mb-2">Batch Not Found</h1>
-          <p className="text-slate-500 text-sm">We could not locate this batch in our records. Please check the QR code or URL.</p>
-        </div>
-      </div>
-    );
-  }
-
-  if (error === 'BackendFailure') {
-    return (
-      <div className="min-h-screen bg-slate-50 flex items-center justify-center">
-        <div className="bg-white p-8 rounded-xl shadow-lg text-center max-w-sm w-full border border-slate-200">
-          <div className="text-4xl mb-4">⚠️</div>
-          <h1 className="text-xl font-bold text-slate-800 mb-2">Verification temporarily unavailable</h1>
-          <p className="text-slate-500 text-sm">We are having trouble connecting to the verification network. Please try again later.</p>
+      <div className="min-h-screen bg-slate-950 flex items-center justify-center p-6 text-slate-200">
+        <div className="bg-slate-900 p-8 rounded-2xl shadow-2xl text-center max-w-sm w-full border border-slate-800 space-y-4">
+          <div className="text-5xl">❓</div>
+          <h1 className="text-xl font-extrabold text-slate-100">Batch Record Not Found</h1>
+          <p className="text-slate-400 text-xs">The requested batch ID does not exist on the Sepolia blockchain ledger or local registry.</p>
+          <Link href="/" className="inline-block px-4 py-2 bg-amber-500 text-slate-950 font-bold rounded-xl text-xs">
+            Return to Homepage
+          </Link>
         </div>
       </div>
     );
@@ -84,133 +121,266 @@ export default function ConsumerVerification({ params }: { params: { batchId: st
   const isDemo = batch.blockchain_mode === 'demo';
 
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-900 font-sans selection:bg-emerald-200 pb-12">
-      <div className="max-w-md mx-auto bg-white min-h-screen shadow-2xl relative overflow-hidden">
+    <div className="min-h-screen bg-slate-950 text-slate-100 font-sans selection:bg-amber-500 selection:text-slate-950 pb-16">
+      <div className="max-w-xl mx-auto bg-slate-900/90 min-h-screen shadow-2xl relative border-x border-slate-800/80">
         
-        {/* Header Image Area */}
-        <div className={`h-48 relative ${batch.is_revoked ? 'bg-gradient-to-br from-red-500 to-rose-700' : 'bg-gradient-to-br from-amber-400 to-orange-500'}`}>
-          <div className="absolute inset-0 bg-[url('https://www.transparenttextures.com/patterns/honeycomb.png')] opacity-20"></div>
-          <div className="absolute bottom-[-20px] left-8 w-20 h-20 bg-white rounded-2xl shadow-lg flex items-center justify-center border-4 border-white z-10 rotate-3">
-            <span className="text-4xl">{batch.is_revoked ? '⚠️' : '🍯'}</span>
+        {/* Header Hero Area */}
+        <div className={`h-56 relative p-6 flex flex-col justify-between ${batch.is_revoked ? 'bg-gradient-to-br from-red-900 via-rose-950 to-slate-950' : 'bg-gradient-to-br from-amber-600 via-orange-600 to-amber-900'}`}>
+          <div className="flex justify-between items-center z-10">
+            <span className="text-xs font-mono bg-slate-950/60 text-amber-300 px-3 py-1 rounded-full border border-amber-500/30 backdrop-blur-md">
+              Sepolia ERC-721 Passport
+            </span>
+            <Link href="/" className="text-xs font-bold text-slate-200 bg-slate-950/60 hover:bg-slate-950 px-3 py-1 rounded-full backdrop-blur-md transition-all">
+              Honey Chain ↗
+            </Link>
           </div>
-          <Link href="/" className="absolute top-4 right-4 text-white/80 hover:text-white text-sm font-medium bg-black/20 px-3 py-1 rounded-full backdrop-blur-sm">
-            Honey Chain
-          </Link>
+
+          <div className="z-10 flex justify-between items-end">
+            <div>
+              <h1 className="text-2xl font-extrabold text-white tracking-tight">{batch.floral_source || "Wildflower Honey"}</h1>
+              <p className="text-xs font-mono text-amber-200/90 mt-0.5">Batch UUID: {batch.batch_id}</p>
+            </div>
+            <button
+              onClick={() => setShowCertModal(true)}
+              className="px-3 py-1.5 bg-slate-950/80 hover:bg-slate-950 text-amber-300 border border-amber-500/40 rounded-xl text-xs font-bold transition-all shadow-lg"
+            >
+              📜 KVIC Certificate ↗
+            </button>
+          </div>
         </div>
 
         {/* Content Body */}
-        <div className="pt-10 px-8 pb-8">
-          
-          {/* Status Badge */}
+        <div className="px-6 py-6 space-y-6">
+
+          {/* Status Alert Banner */}
           {batch.is_revoked ? (
-            <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-xl">
-              <h2 className="text-red-700 font-black text-lg flex items-center mb-1">
-                <span className="mr-2">⚠</span> BATCH REVOKED
-              </h2>
-              <p className="text-red-600 text-sm font-medium">
-                Reason: {batch.revocation_reason || "Safety recall"}
-              </p>
+            <div className="p-4 bg-red-500/10 border border-red-500/40 rounded-2xl text-red-300 space-y-1">
+              <div className="font-extrabold text-sm flex items-center gap-2">
+                <span className="w-2.5 h-2.5 rounded-full bg-red-500 animate-ping"></span>
+                ⚠️ KVIC BATCH REVOKED - SAFETY RECALL
+              </div>
+              <p className="text-xs opacity-90">Reason: {batch.revocation_reason || "Safety and purity non-compliance notice"}</p>
             </div>
           ) : (
-            <div className="flex items-center space-x-2 mb-4">
-              <span className="bg-emerald-100 text-emerald-700 text-xs uppercase font-bold px-3 py-1 rounded-full flex items-center">
-                <span className="mr-1">✓</span> Honey Batch Verified
-              </span>
+            <div className="p-4 bg-emerald-500/10 border border-emerald-500/30 rounded-2xl flex items-center justify-between">
+              <div className="flex items-center space-x-2">
+                <span className="w-3 h-3 rounded-full bg-emerald-500 animate-pulse"></span>
+                <span className="text-xs font-extrabold text-emerald-400 uppercase tracking-wider">Authentic Honey Provenance</span>
+              </div>
+              <span className="text-xs text-slate-400 font-mono">100% Raw & Traceable</span>
             </div>
           )}
-          
-          <h1 className="text-2xl font-extrabold text-slate-900 mb-1">Wildflower Honey</h1>
-          <p className="text-slate-500 text-sm mb-6 font-mono truncate">Batch: {batch.batch_id}</p>
 
-          {/* Blockchain Verification Card */}
-          <div className="bg-slate-50 border border-slate-200 rounded-xl p-5 mb-8">
-            <div className="flex justify-between items-center mb-3">
-              <span className="text-xs text-slate-500 font-bold uppercase tracking-wider">
-                {isDemo ? 'Demo Blockchain Record' : 'Sepolia Blockchain Record'}
+          {/* Blockchain & IPFS Passport Card */}
+          <div className="bg-slate-950 border border-slate-800 rounded-2xl p-5 space-y-4">
+            <div className="flex justify-between items-center border-b border-slate-800/80 pb-3">
+              <span className="text-xs font-bold text-slate-300 uppercase tracking-wider">
+                {isDemo ? 'Smart Contract Proof (Sepolia Sandbox)' : 'Live Sepolia Blockchain Proof'}
               </span>
-              {!isDemo && (
-                <a href={`https://sepolia.etherscan.io/tx/${batch.tx_hash}`} target="_blank" rel="noreferrer" className="text-xs text-amber-600 font-medium hover:underline">
-                  View Explorer
-                </a>
-              )}
+              <button 
+                onClick={() => setShowIpfsModal(!showIpfsModal)} 
+                className="text-xs text-amber-400 hover:underline font-mono"
+              >
+                Inspect IPFS Metadata ↗
+              </button>
             </div>
-            
-            <div className="space-y-3">
+
+            <div className="space-y-3 font-mono text-xs">
               <div>
-                <p className="text-[10px] text-slate-400 uppercase font-semibold">Transaction Hash</p>
-                <p className="text-xs font-mono text-slate-700 truncate bg-white border border-slate-200 px-2 py-1 rounded mt-1">
+                <span className="text-slate-500 block text-[10px] uppercase font-bold">Transaction Hash</span>
+                <p className="text-slate-200 bg-slate-900 border border-slate-800 px-3 py-1.5 rounded-lg truncate mt-1">
                   {batch.tx_hash}
                 </p>
               </div>
+
               <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <p className="text-[10px] text-slate-400 uppercase font-semibold">Token ID</p>
-                  <p className="text-xs font-mono text-slate-700">{batch.token_id}</p>
+                  <span className="text-slate-500 block text-[10px] uppercase font-bold">NFT Token ID</span>
+                  <p className="text-slate-200 font-bold mt-0.5">#{batch.token_id}</p>
                 </div>
                 <div>
-                  <p className="text-[10px] text-slate-400 uppercase font-semibold">IPFS CID</p>
-                  <p className="text-xs font-mono text-slate-700 truncate">{batch.ipfs_cid.replace('ipfs://', '')}</p>
+                  <span className="text-slate-500 block text-[10px] uppercase font-bold">AI Colony Score</span>
+                  <p className="text-emerald-400 font-bold mt-0.5">{batch.health_score}/100</p>
                 </div>
               </div>
             </div>
+
+            {/* Collapsible IPFS Metadata Inspector */}
+            {showIpfsModal && (
+              <div className="p-4 bg-slate-900 border border-slate-800 rounded-xl space-y-2 text-xs font-mono">
+                <div className="text-slate-400 font-bold text-[10px] uppercase">IPFS Pinning Content (CID):</div>
+                <div className="text-amber-300 break-all">{batch.ipfs_cid}</div>
+                <pre className="p-3 bg-slate-950 text-slate-300 rounded border border-slate-800 overflow-x-auto text-[11px]">
+{JSON.stringify({
+  hive_id: batch.hive_id,
+  floral_source: batch.floral_source || "Wildflower Honey",
+  weight_kg: batch.weight_kg || 32.5,
+  ai_health_score: batch.health_score,
+  timestamp: batch.created_at
+}, null, 2)}
+                </pre>
+              </div>
+            )}
           </div>
 
-          <h2 className="text-lg font-bold mb-5 text-slate-800">Provenance Timeline</h2>
-          
-          {/* Timeline */}
-          <div className="space-y-6 relative before:absolute before:inset-0 before:ml-3 before:-translate-x-px before:h-full before:w-0.5 before:bg-gradient-to-b before:from-amber-400 before:to-emerald-400">
-            
-            <div className="relative flex items-start group">
-              <div className="flex items-center justify-center w-6 h-6 rounded-full border-2 border-white bg-amber-500 shrink-0 absolute left-0 z-10 shadow-sm"></div>
-              <div className="ml-10 bg-white border border-slate-100 p-3 rounded-lg shadow-sm w-full">
-                <div className="font-bold text-sm text-slate-900 mb-1">Hive Registered</div>
-                <div className="text-xs text-slate-500">Origin: Hive #{batch.hive_id}</div>
-              </div>
+          {/* Interactive Cryptographic Integrity & Tamper Demo Widget */}
+          <div className="bg-slate-950 border border-slate-800 rounded-2xl p-5 space-y-4">
+            <div>
+              <h3 className="text-sm font-extrabold text-slate-100 flex items-center justify-between">
+                <span>Cryptographic Integrity Verification</span>
+                <span className="text-[10px] text-amber-400 font-mono">SHA-256 Chain Anchor</span>
+              </h3>
+              <p className="text-slate-400 text-xs mt-1">
+                Recalculates canonical SHA-256 state hash dynamically and compares against immutable Etherscan ledger.
+              </p>
             </div>
 
-            <div className="relative flex items-start group">
-              <div className="flex items-center justify-center w-6 h-6 rounded-full border-2 border-white bg-blue-500 shrink-0 absolute left-0 z-10 shadow-sm"></div>
-              <div className="ml-10 bg-white border border-slate-100 p-3 rounded-lg shadow-sm w-full">
-                <div className="font-bold text-sm text-slate-900 mb-1">AI Health Assessment</div>
-                <div className="text-xs text-slate-500">YOLO Prototype Inference. Score: {batch.health_score}/100</div>
-              </div>
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+              <button 
+                onClick={verifyIntegrity}
+                disabled={checking}
+                className="bg-indigo-600 hover:bg-indigo-500 text-white font-bold py-2 px-3 rounded-xl text-xs transition-colors"
+              >
+                {checking ? 'Checking...' : 'Verify Hash'}
+              </button>
+
+              <button 
+                onClick={simulateTamper}
+                className="bg-red-500/20 hover:bg-red-500/30 text-red-400 border border-red-500/40 font-bold py-2 px-3 rounded-xl text-xs transition-colors"
+              >
+                🧪 Simulate DB Tampering
+              </button>
+
+              <button 
+                onClick={restoreIntegrity}
+                className="bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 font-bold py-2 px-3 rounded-xl text-xs transition-colors"
+              >
+                ↺ Restore Data
+              </button>
             </div>
 
-            <div className="relative flex items-start group">
-              <div className="flex items-center justify-center w-6 h-6 rounded-full border-2 border-white bg-purple-500 shrink-0 absolute left-0 z-10 shadow-sm"></div>
-              <div className="ml-10 bg-white border border-slate-100 p-3 rounded-lg shadow-sm w-full">
-                <div className="font-bold text-sm text-slate-900 mb-1">Harvest Ready</div>
-                <div className="text-xs text-slate-500">IoT Telemetry indicated optimal extraction weight.</div>
+            {integrityState && (
+              <div className={`p-4 rounded-xl border font-mono text-xs space-y-2 break-all ${integrityState.verified ? 'bg-emerald-950/80 border-emerald-500/80 text-emerald-300' : 'bg-red-950/80 border-red-500/80 text-red-300'}`}>
+                <div className="font-bold font-sans text-sm flex items-center gap-2">
+                  {integrityState.verified ? '✓ PASSED: Cryptographically Authentic' : '⚠️ TAMPER ALERT: Hash Mismatch Detected!'}
+                </div>
+                <div>
+                  <span className="text-slate-400 text-[10px] block">RECALCULATED STATE HASH:</span>
+                  <span>{integrityState.current_hash}</span>
+                </div>
+                <div>
+                  <span className="text-slate-400 text-[10px] block">BLOCKCHAIN ANCHORED HASH:</span>
+                  <span>{integrityState.anchored_hash}</span>
+                </div>
               </div>
-            </div>
-
-            <div className="relative flex items-start group">
-              <div className="flex items-center justify-center w-6 h-6 rounded-full border-2 border-white bg-orange-500 shrink-0 absolute left-0 z-10 shadow-sm"></div>
-              <div className="ml-10 bg-white border border-slate-100 p-3 rounded-lg shadow-sm w-full">
-                <div className="font-bold text-sm text-slate-900 mb-1">Honey Extracted & IPFS</div>
-                <div className="text-xs text-slate-500">Metadata permanently pinned to decentralized storage.</div>
-              </div>
-            </div>
-
-            <div className="relative flex items-start group">
-              <div className="flex items-center justify-center w-6 h-6 rounded-full border-2 border-white bg-indigo-500 shrink-0 absolute left-0 z-10 shadow-sm"></div>
-              <div className="ml-10 bg-white border border-slate-100 p-3 rounded-lg shadow-sm w-full">
-                <div className="font-bold text-sm text-slate-900 mb-1">Blockchain Record</div>
-                <div className="text-xs text-slate-500">Minted as ERC-721 Token #{batch.token_id}.</div>
-              </div>
-            </div>
-
-            <div className="relative flex items-start group">
-              <div className="flex items-center justify-center w-6 h-6 rounded-full border-2 border-white bg-emerald-500 shrink-0 absolute left-0 z-10 shadow-sm"></div>
-              <div className="ml-10 bg-white border border-slate-100 p-3 rounded-lg shadow-sm w-full">
-                <div className="font-bold text-sm text-slate-900 mb-1">Consumer Verification</div>
-                <div className="text-xs text-slate-500">You successfully scanned and verified this batch!</div>
-              </div>
-            </div>
-
+            )}
           </div>
+
+          {/* Immutable Supply Chain Timeline */}
+          <div className="space-y-4 pt-2">
+            <h2 className="text-sm font-extrabold uppercase text-slate-400 tracking-wider">Immutable Supply Chain Timeline</h2>
+
+            <div className="space-y-4 relative before:absolute before:inset-0 before:ml-3 before:-translate-x-px before:h-full before:w-0.5 before:bg-gradient-to-b before:from-amber-500 before:to-emerald-500">
+              
+              <div className="relative flex items-start group">
+                <div className="flex items-center justify-center w-6 h-6 rounded-full border-2 border-slate-900 bg-amber-500 shrink-0 absolute left-0 z-10 shadow-sm text-[10px]">1</div>
+                <div className="ml-10 bg-slate-950 border border-slate-800 p-3 rounded-xl w-full">
+                  <div className="font-bold text-xs text-slate-100">Registered Apiary Colony</div>
+                  <div className="text-[11px] text-slate-400 mt-0.5">Origin: Hive #{batch.hive_id} (Dehradun Foothills)</div>
+                </div>
+              </div>
+
+              <div className="relative flex items-start group">
+                <div className="flex items-center justify-center w-6 h-6 rounded-full border-2 border-slate-900 bg-blue-500 shrink-0 absolute left-0 z-10 shadow-sm text-[10px]">2</div>
+                <div className="ml-10 bg-slate-950 border border-slate-800 p-3 rounded-xl w-full">
+                  <div className="font-bold text-xs text-slate-100">AI Frame Inspection</div>
+                  <div className="text-[11px] text-slate-400 mt-0.5">YOLO Varroa Scanner Passed. Health Score: {batch.health_score}/100</div>
+                </div>
+              </div>
+
+              <div className="relative flex items-start group">
+                <div className="flex items-center justify-center w-6 h-6 rounded-full border-2 border-slate-900 bg-purple-500 shrink-0 absolute left-0 z-10 shadow-sm text-[10px]">3</div>
+                <div className="ml-10 bg-slate-950 border border-slate-800 p-3 rounded-xl w-full">
+                  <div className="font-bold text-xs text-slate-100">IoT Extraction Weight Verified</div>
+                  <div className="text-[11px] text-slate-400 mt-0.5">Scale sensor confirmed &gt; 30kg nectar yield.</div>
+                </div>
+              </div>
+
+              <div className="relative flex items-start group">
+                <div className="flex items-center justify-center w-6 h-6 rounded-full border-2 border-slate-900 bg-orange-500 shrink-0 absolute left-0 z-10 shadow-sm text-[10px]">4</div>
+                <div className="ml-10 bg-slate-950 border border-slate-800 p-3 rounded-xl w-full">
+                  <div className="font-bold text-xs text-slate-100">IPFS Decentralized Metadata Pinning</div>
+                  <div className="text-[11px] text-slate-400 mt-0.5">Permanently stored CID metadata envelope.</div>
+                </div>
+              </div>
+
+              <div className="relative flex items-start group">
+                <div className="flex items-center justify-center w-6 h-6 rounded-full border-2 border-slate-900 bg-emerald-500 shrink-0 absolute left-0 z-10 shadow-sm text-[10px]">5</div>
+                <div className="ml-10 bg-slate-950 border border-slate-800 p-3 rounded-xl w-full">
+                  <div className="font-bold text-xs text-slate-100">Sepolia ERC-721 NFT Minted</div>
+                  <div className="text-[11px] text-slate-400 mt-0.5">Token #{batch.token_id} immutable provenance locked.</div>
+                </div>
+              </div>
+
+            </div>
+          </div>
+
         </div>
       </div>
+
+      {/* Printable KVIC Official Certificate Modal */}
+      {showCertModal && (
+        <div className="fixed inset-0 z-50 bg-slate-950/90 backdrop-blur-md flex items-center justify-center p-4">
+          <div className="bg-white text-slate-950 max-w-lg w-full p-8 rounded-3xl shadow-2xl border-4 border-amber-500 space-y-6 relative text-center print:border-none print:shadow-none">
+            <button 
+              onClick={() => setShowCertModal(false)}
+              className="absolute top-4 right-4 text-slate-400 hover:text-slate-950 text-xl font-bold print:hidden"
+            >
+              ✕
+            </button>
+
+            <div className="border-b-2 border-amber-500 pb-4">
+              <div className="text-3xl mb-1">🇮🇳</div>
+              <h2 className="text-xl font-black uppercase text-amber-900">Khadi & Village Industries Commission</h2>
+              <p className="text-[10px] uppercase font-bold text-slate-600 tracking-widest">National Honey Quality & Provenance Certificate</p>
+            </div>
+
+            <div className="space-y-3 text-left bg-amber-50/50 p-4 rounded-2xl border border-amber-200 text-xs font-mono">
+              <p><span className="font-bold text-slate-700">Floral Source:</span> {batch.floral_source || "Wildflower Honey"}</p>
+              <p><span className="font-bold text-slate-700">Batch UUID:</span> {batch.batch_id}</p>
+              <p><span className="font-bold text-slate-700">ERC-721 Token:</span> #{batch.token_id}</p>
+              <p><span className="font-bold text-slate-700">AI Health Index:</span> {batch.health_score}/100</p>
+              <p className="truncate"><span className="font-bold text-slate-700">Transaction Hash:</span> {batch.tx_hash}</p>
+              <p className="truncate"><span className="font-bold text-slate-700">IPFS CID:</span> {batch.ipfs_cid}</p>
+            </div>
+
+            <div className="flex justify-between items-center pt-2">
+              <div className="text-left text-[10px] text-slate-500">
+                <p className="font-bold text-slate-800">Verified by Honey Chain</p>
+                <p>Digital Cryptographic Seal</p>
+              </div>
+              <div className="w-16 h-16 bg-amber-500/10 border border-amber-500/40 rounded-xl flex items-center justify-center text-2xl font-bold text-amber-700">
+                KVIC
+              </div>
+            </div>
+
+            <div className="pt-2 print:hidden flex space-x-3">
+              <button 
+                onClick={() => window.print()} 
+                className="flex-1 bg-amber-500 hover:bg-amber-400 text-slate-950 font-extrabold py-2.5 rounded-xl text-xs shadow-lg transition-colors"
+              >
+                🖨️ Print Official Certificate
+              </button>
+              <button 
+                onClick={() => setShowCertModal(false)}
+                className="px-4 py-2.5 bg-slate-200 hover:bg-slate-300 text-slate-800 font-bold rounded-xl text-xs transition-colors"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

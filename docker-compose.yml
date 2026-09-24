@@ -20,6 +20,8 @@ services:
       - "8005:8000"
     environment:
       - DATABASE_URL=postgresql://honeyuser:honeypassword@postgres:5432/honeydb
+    env_file:
+      - .env
     depends_on:
       - postgres
     volumes:
@@ -43,7 +45,7 @@ services:
     working_dir: /app
     volumes:
       - ./iot/simulator:/app
-    command: python simulator.py
+    command: python simulator.py --scenario DEMO_MODE
     depends_on:
       - backend
 
