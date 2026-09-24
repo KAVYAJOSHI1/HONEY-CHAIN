@@ -7,7 +7,11 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Optional
 
+from dotenv import load_dotenv
 from fastapi import HTTPException
+
+load_dotenv()
+load_dotenv(os.path.join(os.path.dirname(__file__), "../../.env"))
 
 logger = logging.getLogger("honeychain.services")
 
