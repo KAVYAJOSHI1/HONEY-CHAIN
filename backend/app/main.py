@@ -185,6 +185,7 @@ def serialize_batch(db: Session, b: models.Batch, include_origin: bool = True) -
         "created_at": iso(b.created_at),
         "updated_at": iso(b.updated_at),
         "verification_url": utils.verification_url(b.batch_id),
+        "qr_url": utils.qr_url(b.batch_id, b.blockchain_mode, b.tx_hash),
     }
     if include_origin:
         hive = db.query(models.Hive).filter(models.Hive.id == b.hive_id).first()
@@ -811,7 +812,7 @@ def mint_batch(batch: BatchCreate, db: Session = Depends(database.get_db), _user
 
     data = serialize_batch(db, db_batch)
     data["weight_kg"] = batch.weight
-    data["qr_code"] = utils.generate_qr_code(batch_uuid)
+    data["qr_code"] = utils.generate_qr_code(data["qr_url"])
     return data
 
 
@@ -828,7 +829,8 @@ def get_batch(batch_id: str, db: Session = Depends(database.get_db)):
 @app.get("/batches/{batch_id}/qr", tags=["Blockchain & Traceability"])
 def get_batch_qr(batch_id: str, db: Session = Depends(database.get_db)):
     b = get_batch_or_404(db, batch_id)
-    return {"batch_id": b.batch_id, "verification_url": utils.verification_url(b.batch_id), "qr_code": utils.generate_qr_code(b.batch_id)}
+    url = utils.qr_url(b.batch_id, b.blockchain_mode, b.tx_hash)
+    return {"batch_id": b.batch_id, "verification_url": utils.verification_url(b.batch_id), "qr_url": url, "qr_code": utils.generate_qr_code(url)}
 
 
 @app.post("/batches/{batch_id}/revoke", tags=["Blockchain & Traceability"])
@@ -915,7 +917,7 @@ def verify_onchain(batch_id: str, db: Session = Depends(database.get_db)):
             'token_valid': is_valid,
             'contract_address': contract_address,
             'chain_id': 11155111,
-            'explorer_url': f'https://sepolia.etherscan.io/tx/{b.tx_hash}' if b.tx_hash else None,
+            'explorer_url': utils.explorer_url(b.tx_hash) if b.tx_hash else None,
         }
         
         # Consensus: both off-chain and on-chain agree

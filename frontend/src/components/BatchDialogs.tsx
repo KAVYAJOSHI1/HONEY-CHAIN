@@ -13,13 +13,14 @@ import { useToast } from "@/components/ui/Toast";
 const FLORAL_SOURCES = ["Wildflower Honey", "Acacia Honey", "Mustard Honey", "Eucalyptus Honey", "Litchi Honey", "Jamun Honey", "Sundarbans Mangrove Honey", "Multiflora Honey"];
 
 function QrBlock({ batchId, qr, url }: { batchId: string; qr: string; url: string }) {
+  const onChain = url.includes("etherscan.io");
   return (
     <div className="flex flex-col items-center gap-4 sm:flex-row sm:items-start">
       {/* eslint-disable-next-line @next/next/no-img-element -- base64 data URI */}
       <img src={qr} alt={`QR code for batch ${batchId}`} className="h-40 w-40 rounded-lg bg-white p-2" />
       <div className="min-w-0 flex-1 space-y-3 text-sm">
         <div>
-          <p className="label">Verification link</p>
+          <p className="label">{onChain ? "Scans to Sepolia transaction" : "Scans to passport"}</p>
           <div className="mt-1 flex items-center gap-1">
             <code className="truncate rounded bg-canvas px-2 py-1 text-xs text-ink-2">{url}</code>
             <CopyButton value={url} />
@@ -29,11 +30,16 @@ function QrBlock({ batchId, qr, url }: { batchId: string; qr: string; url: strin
           <a href={qr} download={`honeychain-${batchId}.png`}>
             <Button size="sm"><Download className="h-3.5 w-3.5" /> Download QR</Button>
           </a>
+          {onChain && (
+            <a href={url} target="_blank" rel="noreferrer">
+              <Button size="sm"><ExternalLink className="h-3.5 w-3.5" /> View on Etherscan</Button>
+            </a>
+          )}
           <Link href={`/consumer/${batchId}`} target="_blank">
             <Button size="sm"><ExternalLink className="h-3.5 w-3.5" /> Open passport</Button>
           </Link>
         </div>
-        <p className="text-xs text-ink-3">Print this on the jar label. Scanning opens the public provenance passport.</p>
+        <p className="text-xs text-ink-3">Print this on the jar label. {onChain ? "Scanning opens the live Sepolia mint transaction on Etherscan." : "Scanning opens the public provenance passport."}</p>
       </div>
     </div>
   );
@@ -116,7 +122,7 @@ export function MintBatchDialog({
               <dd className="mt-0.5 flex items-center gap-1 font-mono text-xs text-ink-2">{shortHash(minted.tx_hash, 18, 10)} <CopyButton value={minted.tx_hash} /></dd>
             </div>
           </dl>
-          {minted.qr_code && <QrBlock batchId={minted.batch_id} qr={minted.qr_code} url={minted.verification_url} />}
+          {minted.qr_code && <QrBlock batchId={minted.batch_id} qr={minted.qr_code} url={minted.qr_url} />}
         </div>
       ) : (
         <div className="space-y-4">
@@ -153,16 +159,16 @@ export function MintBatchDialog({
 }
 
 export function QrDialog({ batchId, onClose }: { batchId: string | null; onClose: () => void }) {
-  const [data, setData] = useState<{ qr_code: string; verification_url: string } | null>(null);
+  const [data, setData] = useState<{ qr_code: string; qr_url: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
   useEffect(() => {
     setData(null);
     setError(null);
-    if (batchId) api.get<{ qr_code: string; verification_url: string }>(`/batches/${batchId}/qr`).then(setData).catch((e) => setError(e.message));
+    if (batchId) api.get<{ qr_code: string; qr_url: string }>(`/batches/${batchId}/qr`).then(setData).catch((e) => setError(e.message));
   }, [batchId]);
   return (
     <Modal open={!!batchId} onClose={onClose} title="Batch QR code" description={batchId ?? undefined}>
-      {error ? <p className="text-sm text-critical">{error}</p> : data && batchId ? <QrBlock batchId={batchId} qr={data.qr_code} url={data.verification_url} /> : <div className="h-40 animate-pulse rounded-lg bg-surface-2" />}
+      {error ? <p className="text-sm text-critical">{error}</p> : data && batchId ? <QrBlock batchId={batchId} qr={data.qr_code} url={data.qr_url} /> : <div className="h-40 animate-pulse rounded-lg bg-surface-2" />}
     </Modal>
   );
 }

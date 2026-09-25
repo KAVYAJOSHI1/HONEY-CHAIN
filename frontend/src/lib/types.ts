@@ -158,6 +158,7 @@ export interface Batch {
   created_at: string;
   updated_at: string;
   verification_url: string;
+  qr_url: string;
   origin?: BatchOrigin;
   qr_code?: string;
 }
