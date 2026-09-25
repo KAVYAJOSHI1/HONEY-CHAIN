@@ -68,7 +68,7 @@ export function AppShell({ children }: { children: ReactNode }) {
 
       {mobileOpen && (
         <div className="fixed inset-0 z-50 lg:hidden">
-          <div className="absolute inset-0 bg-black/60" onClick={() => setMobileOpen(false)} />
+          <div className="absolute inset-0 bg-black/30" onClick={() => setMobileOpen(false)} />
           <aside className="absolute inset-y-0 left-0 w-64 animate-fade-in border-r border-line bg-surface">
             <button className="absolute right-3 top-4 rounded p-1 text-ink-3 hover:text-ink" onClick={() => setMobileOpen(false)} aria-label="Close menu">
               <X className="h-4 w-4" />

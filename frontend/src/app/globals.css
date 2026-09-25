@@ -2,28 +2,28 @@
 @tailwind components;
 @tailwind utilities;
 
-/* Design tokens (RGB triplets so Tailwind can apply alpha). Dark-first product UI. */
+/* Design tokens (RGB triplets so Tailwind can apply alpha). Light, warm-neutral product UI. */
 :root {
-  color-scheme: dark;
-  --canvas: 17 17 16;
-  --surface: 26 26 25;
-  --surface-2: 35 35 33;
-  --surface-3: 46 46 43;
-  --line: 46 46 43;
-  --line-strong: 64 64 60;
-  --ink: 245 245 242;
-  --ink-2: 195 194 183;
-  --ink-3: 143 142 134;
-  --brand: 245 165 36;
-  --brand-strong: 250 186 70;
-  /* Reserved status palette — always paired with an icon + label. */
-  --good: 12 163 12;
-  --warn: 250 178 25;
-  --serious: 236 131 90;
-  --critical: 208 59 59;
-  --info: 57 135 229;
-  /* Single-series chart ink (categorical slot 1, dark step). */
-  --series: 57 135 229;
+  color-scheme: light;
+  --canvas: 250 249 246;
+  --surface: 255 255 255;
+  --surface-2: 245 243 238;
+  --surface-3: 235 232 225;
+  --line: 229 226 219;
+  --line-strong: 206 202 192;
+  --ink: 28 27 24;
+  --ink-2: 74 71 64;
+  --ink-3: 112 108 99;
+  --brand: 217 119 6;
+  --brand-strong: 180 83 9;
+  /* Reserved status palette — always paired with an icon + label. Darker steps for contrast on white. */
+  --good: 21 128 61;
+  --warn: 161 98 7;
+  --serious: 194 65 12;
+  --critical: 200 40 40;
+  --info: 37 99 235;
+  /* Single-series chart ink (categorical slot 1). */
+  --series: 37 99 235;
 }
 
 html, body {
@@ -59,14 +59,14 @@ body {
   .table-base tbody tr { @apply transition-colors hover:bg-surface-2/60; }
 }
 
-/* Leaflet dark treatment */
+/* Leaflet treatment */
 .leaflet-container { background: rgb(var(--surface-2)); font-family: inherit; }
-.leaflet-popup-content-wrapper, .leaflet-popup-tip { background: rgb(var(--surface-2)); color: rgb(var(--ink)); box-shadow: 0 8px 24px rgb(0 0 0 / 0.5); }
+.leaflet-popup-content-wrapper, .leaflet-popup-tip { background: rgb(var(--surface-2)); color: rgb(var(--ink)); box-shadow: 0 8px 24px rgb(0 0 0 / 0.12); }
 .leaflet-popup-content { margin: 10px 12px; font-size: 12px; line-height: 1.5; }
-.leaflet-control-attribution { background: rgb(0 0 0 / 0.55) !important; color: rgb(var(--ink-3)) !important; }
+.leaflet-control-attribution { background: rgb(255 255 255 / 0.8) !important; color: rgb(var(--ink-3)) !important; }
 .leaflet-control-attribution a { color: rgb(var(--ink-2)) !important; }
-/* Dark treatment for standard OSM raster tiles. */
-.map-tiles { filter: invert(1) hue-rotate(180deg) brightness(0.85) contrast(0.9) saturate(0.35); }
+/* Soften standard OSM raster tiles so status markers stand out. */
+.map-tiles { filter: saturate(0.6) contrast(0.95); }
 .leaflet-bar a { background: rgb(var(--surface-2)); color: rgb(var(--ink)); border-color: rgb(var(--line)); }
 
 @media print {

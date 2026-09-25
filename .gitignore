@@ -49,3 +49,9 @@ blockchain/cache/
 .pytest_cache/
 frontend/next-env.d.ts
 frontend/tsconfig.tsbuildinfo
+
+# Varroa model training (dataset, runs, downloaded base weights)
+ml/varroa/data/
+ml/varroa/runs/
+ml/varroa/*.pt
+ml/varroa/train.log

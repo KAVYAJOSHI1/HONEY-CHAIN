@@ -55,6 +55,17 @@ async function syntheticFrame(kind: "healthy" | "varroa"): Promise<File> {
   return new File([blob], `${kind}_sample_frame.png`, { type: "image/png" });
 }
 
+/** Real held-out EV2 test photos (public/samples) when present, else a drawn frame. */
+async function sampleFrame(kind: "healthy" | "varroa"): Promise<File> {
+  try {
+    const res = await fetch(`/samples/bee-${kind}.png`);
+    if (res.ok) return new File([await res.blob()], `bee-${kind}.png`, { type: "image/png" });
+  } catch {
+    /* fall back to the drawn frame */
+  }
+  return syntheticFrame(kind);
+}
+
 export function FrameInspector({ hiveId, onAnalyzed }: { hiveId: number; onAnalyzed?: () => void }) {
   const [result, setResult] = useState<FrameResult | null>(null);
   const [preview, setPreview] = useState<string | null>(null);
@@ -79,7 +90,9 @@ export function FrameInspector({ hiveId, onAnalyzed }: { hiveId: number; onAnaly
       toast({
         kind: r.health_score < 70 ? "error" : "success",
         title: r.health_score < 70 ? "Varroa risk detected" : "Frame looks healthy",
-        description: `${r.mite_count} mites · frame health ${r.health_score}/100`,
+        description: r.model === "simulated"
+          ? `${r.mite_count} mites · frame health ${r.health_score}/100`
+          : `Varroa probability ${Math.round((r.varroa_probability ?? 0) * 100)}% · health ${r.health_score}/100`,
       });
     } catch (e) {
       toast({ kind: "error", title: "Analysis failed", description: e instanceof Error ? e.message : undefined });
@@ -100,6 +113,7 @@ export function FrameInspector({ hiveId, onAnalyzed }: { hiveId: number; onAnaly
   };
 
   const tone = result ? scoreTone(result.health_score) : null;
+  const trained = !!result && result.model !== undefined && result.model !== "simulated";
 
   return (
     <div className="space-y-4">
@@ -108,10 +122,10 @@ export function FrameInspector({ hiveId, onAnalyzed }: { hiveId: number; onAnaly
         <Button size="sm" variant="primary" onClick={() => inputRef.current?.click()} loading={busy === "upload"} disabled={!!busy}>
           <ImageUp className="h-3.5 w-3.5" /> Upload frame photo
         </Button>
-        <Button size="sm" onClick={async () => analyze(await syntheticFrame("healthy"), "healthy")} loading={busy === "healthy"} disabled={!!busy}>
+        <Button size="sm" onClick={async () => analyze(await sampleFrame("healthy"), "healthy")} loading={busy === "healthy"} disabled={!!busy}>
           <ShieldCheck className="h-3.5 w-3.5 text-good" /> Sample: healthy
         </Button>
-        <Button size="sm" onClick={async () => analyze(await syntheticFrame("varroa"), "varroa")} loading={busy === "varroa"} disabled={!!busy}>
+        <Button size="sm" onClick={async () => analyze(await sampleFrame("varroa"), "varroa")} loading={busy === "varroa"} disabled={!!busy}>
           <Bug className="h-3.5 w-3.5 text-critical" /> Sample: infested
         </Button>
       </div>
@@ -156,11 +170,11 @@ export function FrameInspector({ hiveId, onAnalyzed }: { hiveId: number; onAnaly
             <dd className={`mt-1 text-lg font-semibold tabular-nums ${toneClasses[tone].text}`}>{result.health_score}<span className="text-xs text-ink-3">/100</span></dd>
           </div>
           <div className="rounded-lg border border-line bg-surface-2/50 p-3">
-            <dt className="label">Varroa mites</dt>
+            <dt className="label">{trained ? "Varroa-positive regions" : "Varroa mites"}</dt>
             <dd className="mt-1 text-lg font-semibold tabular-nums">{result.mite_count}</dd>
           </div>
           <div className="rounded-lg border border-line bg-surface-2/50 p-3">
-            <dt className="label">Bees counted</dt>
+            <dt className="label">{trained ? "Regions analysed" : "Bees counted"}</dt>
             <dd className="mt-1 text-lg font-semibold tabular-nums">{result.bee_count}</dd>
           </div>
           <div className="rounded-lg border border-line bg-surface-2/50 p-3">
@@ -169,7 +183,11 @@ export function FrameInspector({ hiveId, onAnalyzed }: { hiveId: number; onAnaly
           </div>
         </dl>
       )}
-      <p className="text-[11px] text-ink-3">Prototype detector: inference is simulated but deterministic per image. Not a substitute for a sticky-board count.</p>
+      <p className="text-[11px] text-ink-3">
+        {trained
+          ? "YOLOv8n classifier trained on the EV2 bee dataset (Zenodo 13771384, CC-BY 4.0). Trained on close-up bee photos; frame photos are scored region by region. Not a substitute for a sticky-board count."
+          : "Prototype detector: inference is simulated but deterministic per image. Not a substitute for a sticky-board count."}
+      </p>
     </div>
   );
 }

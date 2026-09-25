@@ -17,7 +17,7 @@ function QrBlock({ batchId, qr, url }: { batchId: string; qr: string; url: strin
   return (
     <div className="flex flex-col items-center gap-4 sm:flex-row sm:items-start">
       {/* eslint-disable-next-line @next/next/no-img-element -- base64 data URI */}
-      <img src={qr} alt={`QR code for batch ${batchId}`} className="h-40 w-40 rounded-lg bg-white p-2" />
+      <img src={qr} alt={`QR code for batch ${batchId}`} className="h-40 w-40 rounded-lg border border-line bg-white p-2" />
       <div className="min-w-0 flex-1 space-y-3 text-sm">
         <div>
           <p className="label">{onChain ? "Scans to Sepolia transaction" : "Scans to passport"}</p>
@@ -151,7 +151,7 @@ export function MintBatchDialog({
               <span className="mt-1 block text-[11px] text-ink-3">From live hive diagnostics</span>
             </div>
           </div>
-          {error && <p className="rounded-lg border border-critical/30 bg-critical/10 px-3 py-2 text-sm text-[#ff8f8f]">{error}</p>}
+          {error && <p className="rounded-lg border border-critical/30 bg-critical/10 px-3 py-2 text-sm text-critical">{error}</p>}
         </div>
       )}
     </Modal>
@@ -227,7 +227,7 @@ export function RevokeDialog({ batch, onClose, onRevoked }: { batch: Batch | nul
           <input className="input mt-1" list="revoke-reasons" value={reason} onChange={(e) => setReason(e.target.value)} maxLength={300} />
           <datalist id="revoke-reasons">{REVOKE_REASONS.map((r) => <option key={r} value={r} />)}</datalist>
         </label>
-        {error && <p className="rounded-lg border border-critical/30 bg-critical/10 px-3 py-2 text-sm text-[#ff8f8f]">{error}</p>}
+        {error && <p className="rounded-lg border border-critical/30 bg-critical/10 px-3 py-2 text-sm text-critical">{error}</p>}
       </div>
     </Modal>
   );

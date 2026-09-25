@@ -7,7 +7,7 @@ import type { LatLngBoundsExpression } from "leaflet";
 import { hiveMeta } from "@/lib/status";
 import type { Hive } from "@/lib/types";
 
-const STATUS_HEX: Record<string, string> = { good: "#0ca30c", warn: "#fab219", serious: "#ec835a", critical: "#d03b3b" };
+const STATUS_HEX: Record<string, string> = { good: "#15803d", warn: "#ca8a04", serious: "#ea580c", critical: "#c82828" };
 
 function FitBounds({ bounds }: { bounds: LatLngBoundsExpression | null }) {
   const map = useMap();
@@ -36,16 +36,16 @@ export default function ApiaryMapInner({ hives, height = 360 }: { hives: Hive[];
       <FitBounds bounds={bounds} />
       {pts.map((h) => {
         const m = hiveMeta(h.status);
-        const color = STATUS_HEX[m.tone] ?? "#8f8e86";
+        const color = STATUS_HEX[m.tone] ?? "#706c63";
         return (
           <CircleMarker key={h.id} center={[h.gps_lat, h.gps_long]} radius={7}
-            pathOptions={{ color: "#1a1a19", weight: 2, fillColor: color, fillOpacity: 0.95 }}>
+            pathOptions={{ color: "#ffffff", weight: 2, fillColor: color, fillOpacity: 0.95 }}>
             <Popup>
               <div className="space-y-0.5">
                 <div className="font-semibold">Hive #{h.id} · {m.label}</div>
                 <div>{h.cluster_name}</div>
                 <div>Health {h.health_score}/100{h.latest_weight != null ? ` · ${h.latest_weight} kg` : ""}</div>
-                <Link href={`/beekeeper/hives/${h.id}`} className="font-medium text-[#f5a524]">Open hive →</Link>
+                <Link href={`/beekeeper/hives/${h.id}`} className="font-medium text-brand">Open hive →</Link>
               </div>
             </Popup>
           </CircleMarker>

@@ -30,8 +30,8 @@ const config: Config = {
         mono: ["var(--font-geist-mono)", "ui-monospace", "monospace"],
       },
       boxShadow: {
-        card: "0 1px 0 0 rgb(255 255 255 / 0.03) inset, 0 1px 2px 0 rgb(0 0 0 / 0.4)",
-        pop: "0 12px 32px -8px rgb(0 0 0 / 0.6), 0 0 0 1px rgb(var(--line))",
+        card: "0 1px 2px 0 rgb(28 27 24 / 0.06)",
+        pop: "0 12px 32px -8px rgb(28 27 24 / 0.18), 0 0 0 1px rgb(var(--line))",
       },
       keyframes: {
         "fade-in": { from: { opacity: "0", transform: "translateY(4px)" }, to: { opacity: "1", transform: "none" } },

@@ -1,0 +1,19 @@
+{
+  "split": "test (7 held-out videos, never seen in training)",
+  "images": 777,
+  "accuracy": 0.6808,
+  "precision_varroa": 0.6801,
+  "recall_varroa": 0.8568,
+  "f1_varroa": 0.7583,
+  "roc_auc": 0.7579,
+  "confusion": {
+    "tn": 140,
+    "fp": 183,
+    "fn": 65,
+    "tp": 389
+  },
+  "model": "YOLOv8n-cls, ImageNet-pretrained, fine-tuned on EV2 (Zenodo 13771384, CC-BY 4.0)",
+  "selected_epoch": "best validation top-1 (epoch 9: 0.9348 on 5 validation videos)",
+  "task": "is a Varroa mite visible on this bee in this frame",
+  "note": "310 of the 323 'no visible mite' test frames come from infested bees whose mite is out of view; the one fully Varroa-free test bee (13 frames) was classified correctly in all frames."
+}

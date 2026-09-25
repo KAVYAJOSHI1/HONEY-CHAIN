@@ -60,7 +60,7 @@ export default function HoneyBot() {
         className="no-print fixed bottom-5 right-5 z-[900] flex h-12 items-center gap-2 rounded-full border border-brand/40 bg-surface-2 pl-3 pr-4 text-sm font-medium text-ink shadow-pop transition hover:border-brand"
         aria-label="Open HoneyBot assistant"
       >
-        <span className="flex h-7 w-7 items-center justify-center rounded-full bg-brand text-canvas">
+        <span className="flex h-7 w-7 items-center justify-center rounded-full bg-brand text-white">
           <Bot className="h-4 w-4" />
         </span>
         <span className="hidden sm:inline">Ask HoneyBot</span>
@@ -71,7 +71,7 @@ export default function HoneyBot() {
   return (
     <div className="no-print fixed inset-x-3 bottom-3 z-[900] flex h-[min(520px,80vh)] animate-fade-in flex-col overflow-hidden rounded-2xl border border-line bg-surface shadow-pop sm:inset-x-auto sm:right-5 sm:w-96">
       <div className="flex items-center gap-3 border-b border-line px-4 py-3">
-        <span className="flex h-8 w-8 items-center justify-center rounded-full bg-brand text-canvas">
+        <span className="flex h-8 w-8 items-center justify-center rounded-full bg-brand text-white">
           <Bot className="h-4 w-4" />
         </span>
         <div className="min-w-0 flex-1">
@@ -88,7 +88,7 @@ export default function HoneyBot() {
           <div key={i} className={`flex ${m.sender === "user" ? "justify-end" : "justify-start"}`}>
             <div
               className={`max-w-[88%] whitespace-pre-line rounded-2xl px-3 py-2 leading-relaxed ${
-                m.sender === "user" ? "rounded-br-sm bg-brand text-canvas" : "rounded-bl-sm border border-line bg-surface-2 text-ink-2"
+                m.sender === "user" ? "rounded-br-sm bg-brand text-white" : "rounded-bl-sm border border-line bg-surface-2 text-ink-2"
               }`}
             >
               {m.text}
@@ -117,7 +117,7 @@ export default function HoneyBot() {
 
       <form onSubmit={onSubmit} className="flex gap-2 border-t border-line p-3">
         <input ref={inputRef} value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Ask about your hives…" className="input" aria-label="Message HoneyBot" maxLength={500} />
-        <button type="submit" disabled={loading || !query.trim()} className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-brand text-canvas disabled:opacity-40" aria-label="Send">
+        <button type="submit" disabled={loading || !query.trim()} className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-brand text-white disabled:opacity-40" aria-label="Send">
           <Send className="h-4 w-4" />
         </button>
       </form>

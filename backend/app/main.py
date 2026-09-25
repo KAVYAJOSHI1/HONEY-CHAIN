@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session
 from . import database, models, utils
 from .auth import create_access_token, get_current_user, get_current_user_optional, require_role, LoginRequest
 from .ai.anomaly_detector import HiveAnomalyDetector
-from .ai.vision_model import InvalidImageError, vision_model
+from .ai.vision_model import InvalidImageError, YoloVarroaDetector, vision_model
 from .intelligence import (
     HARVEST_WEIGHT_KG, compute_health, compute_productivity, compute_recommendations, refresh_hive_status,
 )
@@ -345,6 +345,7 @@ def system_health(db: Session = Depends(database.get_db)):
         "database": db_status,
         "database_engine": database.engine.dialect.name,
         "yolo_model": "LOADED" if vision_model.model_loaded else "OFFLINE",
+        "varroa_model": "SIMULATED" if isinstance(vision_model, YoloVarroaDetector) else "TRAINED",
         "isolation_forest": "TRAINED" if anomaly_detector.is_trained else "RULE_FALLBACK",
         "blockchain_mode": BLOCKCHAIN_MODE.upper(),
         "ipfs_mode": "MOCK" if IPFS_MODE != "real" else "LIVE",
@@ -772,7 +773,7 @@ async def analyze_hive_frame(
     record_audit_log(db, action="AI Frame Inspection", actor="Vision Model",
                      details=f"Analyzed frame for Hive #{hive_id}. Varroa: {results['mite_count']}, score: {results['health_score']}")
 
-    return {"filename": file.filename, "results": results, "model_status": "prototype_inference", "analysis_id": analysis.id}
+    return {"filename": file.filename, "results": results, "model_status": "simulated_inference" if results.get("model") == "simulated" else "trained_model", "analysis_id": analysis.id}
 
 
 # --- Batches & blockchain ------------------------------------------------------

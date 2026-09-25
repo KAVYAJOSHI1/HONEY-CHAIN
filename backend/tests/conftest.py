@@ -4,6 +4,8 @@ import os
 # Must be set before importing app modules
 os.environ.setdefault("DATABASE_URL", "sqlite:///./test_honeychain.db")
 os.environ.setdefault("BLOCKCHAIN_MODE", "demo")
+# API tests use the deterministic simulated detector; test_varroa_model.py covers the trained one.
+os.environ.setdefault("VARROA_MODEL", "simulated")
 
 from app.auth import create_access_token
 from app.models import User

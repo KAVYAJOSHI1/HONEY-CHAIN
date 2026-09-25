@@ -1,0 +1,4 @@
+bee-healthy.png and bee-varroa.png are frames from the EV2 Dataset
+(Zenodo record 13771384, https://zenodo.org/records/13771384), licensed CC-BY 4.0.
+Both come from videos held out of training (test split). bee-healthy.png: 10_01026.MTS frame 2
+(Varroa-free bee); bee-varroa.png: 19_00974.MTS frame 133 (mite visible).

@@ -108,6 +108,9 @@ export interface Detection {
 
 export interface FrameResult {
   status: string;
+  model?: string;
+  regions_analyzed?: number;
+  varroa_probability?: number;
   image_width: number;
   image_height: number;
   mite_count: number;
@@ -208,6 +211,7 @@ export interface SystemHealth {
   database: string;
   database_engine: string;
   yolo_model: string;
+  varroa_model?: "TRAINED" | "SIMULATED";
   isolation_forest: string;
   blockchain_mode: string;
   ipfs_mode: string;

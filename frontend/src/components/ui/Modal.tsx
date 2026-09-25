@@ -34,7 +34,7 @@ export function Modal({
   if (!open) return null;
   return (
     <div className="fixed inset-0 z-[1000] flex items-end justify-center p-0 sm:items-center sm:p-4" role="dialog" aria-modal="true">
-      <div className="no-print absolute inset-0 bg-black/70 backdrop-blur-sm" onClick={onClose} />
+      <div className="no-print absolute inset-0 bg-black/40 backdrop-blur-sm" onClick={onClose} />
       <div className={`relative w-full animate-fade-in rounded-t-2xl border border-line bg-surface shadow-pop sm:rounded-2xl ${size === "lg" ? "sm:max-w-2xl" : "sm:max-w-lg"}`}>
         <div className="no-print flex items-start justify-between gap-4 border-b border-line px-5 py-4">
           <div>
