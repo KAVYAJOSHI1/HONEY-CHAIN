@@ -1,10 +1,23 @@
 import base64
 import io
 import os
+import socket
 
 import qrcode
 
-FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000").rstrip("/")
+
+def _lan_ip() -> str:
+    """This machine's LAN address, so QR codes scanned by a phone on the same network resolve."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("10.255.255.255", 1))  # UDP connect sends no packets; it only picks a route
+            return s.getsockname()[0]
+    except OSError:
+        return "localhost"
+
+
+# "localhost" in a QR code points at the scanning phone itself, so default to the LAN address.
+FRONTEND_URL = (os.getenv("FRONTEND_URL") or f"http://{_lan_ip()}:3000").rstrip("/")
 
 
 def verification_url(batch_id: str) -> str:

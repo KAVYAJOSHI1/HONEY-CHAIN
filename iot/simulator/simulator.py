@@ -5,7 +5,7 @@ Examples:
   python simulator.py --scenario HIGH_TEMPERATURE --hives 4
   python simulator.py --scenario DEMO_MODE --hives 1,2,3 --interval 3
 Environment:
-  API_URL  telemetry endpoint (default http://localhost:8000/telemetry)
+  API_URL  telemetry endpoint (default http://localhost:8010/telemetry)
 """
 import argparse
 import json
@@ -15,7 +15,7 @@ import time
 import urllib.error
 import urllib.request
 
-API_URL = os.getenv("API_URL", "http://localhost:8000/telemetry")
+API_URL = os.getenv("API_URL", "http://localhost:8010/telemetry")
 
 SCENARIOS = {
     # scenario: (temp base, humidity base, weight base, weight drift per tick)

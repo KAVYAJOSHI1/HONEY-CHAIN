@@ -1,4 +1,7 @@
-export const API_URL = (process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000").replace(/\/$/, "");
+// Without an explicit URL, target port 8010 on whichever host served the page, so a phone that
+// opened a scanned QR link (http://<lan-ip>:3000/...) reaches the API on that same machine.
+const defaultApiUrl = typeof window !== "undefined" ? `${window.location.protocol}//${window.location.hostname}:8010` : "http://localhost:8010";
+export const API_URL = (process.env.NEXT_PUBLIC_API_URL || defaultApiUrl).replace(/\/$/, "");
 
 export class ApiError extends Error {
   constructor(message: string, public status: number) {

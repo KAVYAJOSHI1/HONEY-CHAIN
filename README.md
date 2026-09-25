@@ -49,7 +49,7 @@ The database is seeded automatically on first start (3 apiaries, 18 hives, 2 wee
 cd backend
 python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-uvicorn app.main:app --reload --port 8000     # SQLite at backend/honeychain.db, auto-seeded
+uvicorn app.main:app --reload --port 8010     # SQLite at backend/honeychain.db, auto-seeded
 python seed_demo.py                           # optional: reset + reseed
 ```
 
@@ -58,7 +58,7 @@ python seed_demo.py                           # optional: reset + reseed
 ```bash
 cd frontend
 npm install
-echo "NEXT_PUBLIC_API_URL=http://localhost:8000" > .env.local
+echo "NEXT_PUBLIC_API_URL=http://localhost:8010" > .env.local
 npm run dev                                   # http://localhost:3000
 ```
 
@@ -101,7 +101,7 @@ See [`.env.example`](.env.example). Key variables:
 | `AUTO_SEED` | `true` | Seed demo data when the DB is empty |
 | `BLOCKCHAIN_MODE` | `demo` | `sepolia` to mint real tokens |
 | `SEPOLIA_RPC_URL`, `PRIVATE_KEY`, `CONTRACT_ADDRESS` | — | Required for `sepolia` mode |
-| `NEXT_PUBLIC_API_URL` | `http://localhost:8000` | Frontend → API (build-time) |
+| `NEXT_PUBLIC_API_URL` | `http://localhost:8010` | Frontend → API (build-time) |
 
 ### Going on-chain (Sepolia)
 
